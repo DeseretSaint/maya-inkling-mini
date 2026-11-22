@@ -2397,19 +2397,25 @@ static void guard_report_request() {
                  g_guard_fail_pos, g_guard_fail_count, g_guard_fail_first);
     std::fflush(stderr);
 }
-// IK2_TEST_NAN, the test hook: NaN into the first, middle and 1000th logit of the rows at position `at` (0: all rows)
-static void guard_inject_nan(float* d_logits, int ld, int rows, int n, long pos0) {
-    const long at = guard_nan_at();
-    if (at < 0) return;
-    static const float nanv = nanf("");
-    static const int at_i[3] = {5, 7, 1000};
+// IK2_TEST_NAN, the test hook: NaN into the first, middle and 1000th logit of the rows at position `at` (0: all
+// rows).  A one-thread kernel rather than host-to-device copies, so the hook is legal inside the recorded token
+// graph (`fast_token` captures the first decode row's launches: a copy from pageable host memory cannot be captured).
+__global__ void guard_nan_kernel(float* x, int ld, int n, int rows, long at, long pos0) {
+    if (blockIdx.x || threadIdx.x) return;
+    const int at_i[3] = {5, 7, 1000};
+    const float nanv = __int_as_float(0x7fc00000);
     for (int r = 0; r < rows; ++r) {
         const long pos = pos0 + r;
         if (at != 0 && pos != at) continue;
-        float* row = d_logits + (size_t) r * ld;
+        float* row = x + (size_t) r * ld;
         for (int k = 0; k < 3; ++k)
-            if (at_i[k] < n) CU(cudaMemcpyAsync(row + at_i[k], &nanv, 4, cudaMemcpyHostToDevice, g_s));
+            if (at_i[k] < n) row[at_i[k]] = nanv;
     }
+}
+static void guard_inject_nan(float* d_logits, int ld, int rows, int n, long pos0) {
+    const long at = guard_nan_at();
+    if (at < 0) return;
+    guard_nan_kernel<<<1, 1, 0, g_s>>>(d_logits, ld, n, rows, at, pos0);
 }
 
 void run_head(const Model& M, int T, bool all_logits, OutMode out_mode, int nb, const float* h_in, Work& W,
