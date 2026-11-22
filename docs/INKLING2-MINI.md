@@ -94,6 +94,8 @@ The `env` block in the configs:
 
 With `--draft` the engine decides every step whether to draft. A window of B tokens is worth (1 - a^B) / (1 - a) tokens, where a is how often recent drafts were accepted; it drafts when that, over the window's measured time, beats a plain token's time, and after 8 plain tokens it drafts once to look again. `IK2_DRAFT_WIDTH` (default 5) sets the widest window, `IK2_DRAFT_ADAPT=0` always drafts at that width.
 
+A token's logits row is checked for finiteness before any token is chosen (`IK2_GUARD`, on by default). A NaN or Inf there is a numerical fault upstream, and both of the engine's token choosers ignore it - every comparison against a NaN is false, so the argmax keeps its sentinel and the softmax comes out NaN - which would surface as a degenerate repeat instead of an error. On a hit the engine names the token position, the count of non-finite logits and the first offending index on stderr, then fails the request: the one-shot CLI exits non-zero, and `--serve` answers that request with an `ERR` line, drops its cached state and keeps serving the next one. `IK2_GUARD=0` restores the old behaviour. The check is one pass over the row on the token's own stream (no extra synchronisation), and `IK2_TEST_NAN=<position>` injects a NaN to prove it fires.
+
 The tensor core expert kernels are on by default; `IK2_EXPERT_MMA=0` in `env` switches back to the scalar ones, which give the same logits bit for bit as the older builds. Every setting is listed in [SETTINGS.md](SETTINGS.md).
 
 ## Numbers
