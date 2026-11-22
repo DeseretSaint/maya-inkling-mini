@@ -113,7 +113,10 @@ else
 fi
 
 # ---- 2. a forced non-finite row: report it, choose nothing from it, exit non-zero
-NAN_AT=$(( NPROMPT + 8 ))                      # the 9th generated token's position
+# The first decode position: the resident path's first token is also the one whose launch set is captured into the
+# CUDA graph, so the injection is part of the recorded graph and the check is exercised on the default configuration
+# (IK2_GRAPH on), not only one launch at a time.
+NAN_AT=$NPROMPT
 run "$POST" "$WORK/nan.out" "$WORK/nan.err" IK2_TEST_NAN="$NAN_AT" -- --gen 16
 rc_nan=$?
 n_nan=$(( $(tr -cd , <<<"$(tokens_of "$WORK/nan.out")" | wc -c) + 1 ))
@@ -127,18 +130,20 @@ else
     sed -n '1,20p' "$WORK/nan.err"
     fail=1
 fi
-if [ "$n_nan" -le $(( NAN_AT - NPROMPT )) ]; then
+if [ "$n_nan" -le 1 ]; then   # (the prompt's own row chose the first token; nothing was chosen from the bad row)
     say "  no token was chosen from the bad row" "PASS"
 else
     say "  no token was chosen from the bad row" "FAIL ($n_nan tokens printed)"
     fail=1
 fi
 
-# ---- 3. IK2_GUARD=0 restores the old behaviour: the injection is ignored (the same tokens as the pre-change build)
+# ---- 3. IK2_GUARD=0 restores the old behaviour: the injection is ignored and the old tokens come back.  Greedy
+# decode is prefix-deterministic, so the 16-token run is compared with the first 16 of the pre-change 64-token run
+# (one engine start saved: loading this model pins 14.7 GiB of experts, ~200 s).
 run "$POST" "$WORK/off.out" "$WORK/off.err" IK2_GUARD=0 IK2_TEST_NAN="$NAN_AT" -- --gen 16
 rc_off=$?
 tok_off="$(tokens_of "$WORK/off.out")"
-tok_pre16="$(run "$PRE" "$WORK/pre16.out" "$WORK/pre16.err" -- --gen 16; tokens_of "$WORK/pre16.out")"
+tok_pre16="$(cut -d, -f1-16 <<<"$tok_pre")"
 if [ $rc_off -eq 0 ] && [ "$tok_off" = "$tok_pre16" ]; then
     say "IK2_GUARD=0 samples anyway (the old behaviour, for bisection)" "PASS"
 else
