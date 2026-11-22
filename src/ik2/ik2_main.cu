@@ -4085,8 +4085,9 @@ void forward_prefill_sup(Model& M, const int* tok, int T, int pos0, int sub_chun
     // (under EP each GPU prefetches the experts it owns, by GPU 0's picks so far)
     // One layer ahead: two or three layers in flight cost more than they hide - their slots squeeze the cache (2x RTX
     // PRO 6000, a 21.8k prompt: copies 244 -> 328 GiB, 8.05 -> 9.73 s); the next layer's prefetch issued before this
-    // layer's routing round trip instead of after its experts are queued was slower too
-    const int depth = 1;
+    // layer's routing round trip instead of after its experts are queued was slower too.
+    // IK2_PF_DEPTH makes that reach measurable on other hardware instead of a constant (default 1: unchanged).
+    const int depth = getenv("IK2_PF_DEPTH") ? std::max(1, std::atoi(getenv("IK2_PF_DEPTH"))) : 1;
     auto prefetch = [&](int ll, int ahead) {
         if (!dual()) {
             prefetch_layer(M, ll, W, EC, T, nullptr, -1, ahead);
