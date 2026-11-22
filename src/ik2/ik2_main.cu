@@ -17,6 +17,10 @@
 //   maya-ik2 --model FIRST-SHARD.gguf --serve [--max-context 262144] [--cache-gb 60] [--gpus 1] [--threads 8]
 //            [--eos a,b]
 //   maya-ik2 --model FIRST-SHARD.gguf --tokens 1,2,3|@FILE [--gen N] [--chunk 2048] [--dump DIR]
+//   maya-ik2 --model FIRST-SHARD.gguf --kv-plan [--kv-plan-ctx 4096,16384,262144] [--ctx N] [--chunk 2048]
+// --kv-plan: the K / V budget a run allocates, per visit class (sliding-window visits x min(ctx, window + the chunk
+// headroom), the visits without a window x ctx), summed per dtype - printed and exited before a byte is allocated, so
+// an OOM is predicted instead of discovered.  It reads the file's metadata only: no device is opened, no weight read.
 // --serve: Maya's engine protocol on stdin / stdout (serve/server.py's StrataEngine: INFO / READY, GEN, PP, T, DONE,
 // STOP); --serve-ik2 the older @-line one.  --dump: each layer's output (blk.L.out) and the log-probabilities of every
 // prompt position, F32 raw files ([T][C], [T][n_vocab]) - what tools/ik2_compare.py holds against ref/inkling2.py's
@@ -4398,12 +4402,54 @@ void embed_row(Model& M, int t, float* raw, float* out) {
     k::rms(raw, M.embd_norm, 1, C, M.c.eps, out, g_s);
 }
 
+// ---- --kv-plan: the K / V budget a run allocates, per visit class, before a byte of it is allocated.  A visit of a
+// sliding-window layer holds a ring of min(ctx, window + the chunk / verify headroom) rows (the ring is written a
+// chunk at a time, so it is deeper than its window by that much); a visit of a layer without a window holds ctx rows.
+// Every visit holds K and V, KV * D values each, in the run's cache dtype.  Summed here, so an OOM is predicted
+// instead of discovered - and the engine's own "kv cache:" line is this sum, printed when it allocates.
+void print_kv_plan(const Config& c, const std::vector<int>& ctxs, int chunk, bool fp8_in_use) {
+    const size_t KD = (size_t) c.KV * c.D;
+    const int headroom = std::max(chunk, ik2::draft::kBlock);
+    long long n_slide = 0, n_global = 0;
+    for (int l = 0; l < c.n_layer; ++l)
+        ((c.sliding[l]) ? n_slide : n_global) += (l >= c.core0 && l < c.core1) ? c.n_pass : 1;
+    // the F32 buffers beside the cache, a visit: h_k and h_v [3 KD], h_attn and h_mlp [3 C]
+    const size_t state_visit = 2 * 3 * KD * 4 + 2 * 3 * (size_t) c.C * 4;
+    std::printf("kv plan: %d visits a token - %lld sliding-window, %lld global (%d layers, %d passes); "
+                "K + V %zu values a row, window %d, ring headroom %d (chunk %d)\n",
+                c.n_visit, n_slide, n_global, c.n_layer, c.n_pass, KD, c.window, headroom, chunk);
+    std::printf("the cache dtype in use: %s (IK2_KV; both are shown)\n", fp8_in_use ? "FP8 E4M3" : "FP16");
+    for (int ctx : ctxs) {
+        const int slide_cap = std::min(ctx, c.window + headroom);
+        const long long slide_rows = n_slide * slide_cap, global_rows = n_global * (long long) ctx;
+        const long long rows = slide_rows + global_rows;
+        const double f16 = (double) rows * KD * 2 * 2 / 1073741824.0, f8 = (double) rows * KD * 1 * 2 / 1073741824.0;
+        std::printf("\nctx %d\n", ctx);
+        std::printf("  %-8s %7s %11s %11s %11s %10s\n", "class", "visits", "rows/visit", "rows", "FP16 GiB", "FP8 GiB");
+        auto line = [&](const char* name, long long visits, int cap, long long r) {
+            const double a16 = (double) r * KD * 2 * 2 / 1073741824.0, a8 = (double) r * KD * 1 * 2 / 1073741824.0;
+            std::printf("  %-8s %7lld %11d %11lld %11.3f %10.3f\n", name, visits, cap, r, a16, a8);
+        };
+        if (n_slide) line("sliding", n_slide, slide_cap, slide_rows);
+        if (n_global) line("global", n_global, ctx, global_rows);
+        std::printf("  %-8s %7d %11s %11lld %11.3f %10.3f\n", "total", c.n_visit, "", rows, f16, f8);
+        std::printf("  -> the engine's \"kv cache:\" line reads %.2f GiB at IK2_KV=f16 (default) or %.2f GiB at "
+                    "IK2_KV=fp8\n", f16, f8);
+        std::printf("  (+ %.1f MiB of F32 conv / attention state beside the cache: %d visits x %zu bytes)\n",
+                    (double) c.n_visit * state_visit / 1048576.0, c.n_visit, state_visit);
+    }
+    std::printf("\n--kv-plan: nothing was allocated; the run as configured would allocate the row above.\n");
+    std::fflush(stdout);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     std::string model, toks, dump, draft_path;
     int gen = 16, chunk = 2048, ctx = 262144, threads = 8, n_gpu = 1;
     bool serve = false, serve_maya = true;   // (--serve: Maya's engine protocol; --serve-ik2: the @-line one)
+    bool kv_plan = false;                     // (--kv-plan: the K / V budget per visit class, then exit unallocated)
+    std::vector<int> kv_plan_ctxs;            // (--kv-plan-ctx a,b,c: the contexts to plan; default --ctx)
     std::vector<int> eos_ids;                 // --eos a,b: the tokens a request ends at (Maya's protocol)
     double cache_gb = 60;
     int image_token = 200054;   // --image-token: Inkling 2's <|unused_200054|>, the template's placeholder of a picture
@@ -4440,6 +4486,17 @@ int main(int argc, char** argv) {
             }
         }
         else if (a == "--image-token") image_token = std::atoi(next().c_str());
+        else if (a == "--kv-plan") kv_plan = true;
+        else if (a == "--kv-plan-ctx") {   // (a comma list: the contexts to plan, instead of --ctx)
+            const std::string v = next();
+            for (const char* p = v.c_str(); *p;) {
+                while (*p == ',' || std::isspace((unsigned char) *p)) ++p;
+                if (!*p) break;
+                kv_plan_ctxs.push_back(std::atoi(p));
+                while (*p && *p != ',') ++p;
+            }
+            for (int cx : kv_plan_ctxs) if (cx < 1) die("--kv-plan-ctx: a positive context");
+        }
         else if (a == "--dump") dump = next();
         else die("unknown argument " + a);
     }
@@ -4465,8 +4522,8 @@ int main(int argc, char** argv) {
         if (!g_trace) die(std::string("cannot write ") + getenv("IK2_TRACE"));
     }
     g_serve_note = serve && serve_maya;
-    if (model.empty() || (toks.empty() && !serve))
-        die("usage: maya-ik2 --model FIRST.gguf (--tokens 1,2,3 [--gen N] | --serve) [--chunk 2048] [--ctx N] ...");
+    if (model.empty() || (toks.empty() && !serve && !kv_plan))
+        die("usage: maya-ik2 --model FIRST.gguf (--tokens 1,2,3 [--gen N] | --serve | --kv-plan) [--chunk 2048] [--ctx N] ...");
     std::vector<int> prompt;
     for (const char* p = toks.c_str(); *p;) {
         prompt.push_back(std::atoi(p));
@@ -4534,6 +4591,11 @@ int main(int argc, char** argv) {
                     c.core1 - 1, c.n_pass, c.n_visit, c.rank);
         // if (n_gpu != 1) die("a looped model: one GPU so far (--gpus 1)");
         if (!draft_path.empty() && (c.C != 2304 || c.n_visit != 48)) die("--draft: a looped model other than Inkling-2-Mini");
+    }
+    if (kv_plan) {   // (--kv-plan: the K / V budget of the run as configured, per visit class - then exit.  Nothing is
+                     //  allocated: no device is opened, no weight is read, so this is safe beside a run on the card.)
+        print_kv_plan(c, kv_plan_ctxs.empty() ? std::vector<int>{ctx} : kv_plan_ctxs, chunk, g_kv_fp8);
+        return 0;
     }
     if (getenv("IK2_POP_OUT")) g_pop.assign((size_t) c.n_layer * c.E, 0), g_pop_E = c.E;
     g_tp_F = c.F, g_tp_C = c.C;
