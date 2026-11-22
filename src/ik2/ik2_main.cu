@@ -2297,7 +2297,7 @@ static long guard_nan_at() {
 struct GuardScan {   // the rows scanned last: how many logits were non-finite, and the first one's index + 1 (0: none)
     int count, first_p1;
 };
-static GuardScan* g_gs_d = nullptr;   // (the device counter, zeroed before every scan)
+static GuardScan* g_gs_d[8] = {};     // (one per device: with --gpus 2 the head runs on the second; zeroed per scan)
 static GuardScan* g_gs_h = nullptr;   // (pinned: the scan's result, read after the stream's synchronisation)
 static bool g_guard_failed = false;   // (the rows scanned last held a non-finite logit: no token may be chosen)
 static long g_guard_fail_pos = -1;    // (the position reported, the count, the first offending index)
@@ -2306,11 +2306,18 @@ static int g_guard_fail_count = 0, g_guard_fail_first = -1;
 // (isfinite as arithmetic: HIP's header declares the library one for device code only, and this runs on both sides)
 static __host__ __device__ inline bool guard_finite(float v) { return v == v && v > -INFINITY && v < INFINITY; }
 
-static void guard_init() {
-    if (g_gs_d) return;
-    CU(cudaMalloc(&g_gs_d, sizeof(GuardScan)));
+static void guard_init() {   // (once, before any capture: an allocation inside a token graph is not allowed)
+    if (g_gs_h) return;
     CU(cudaHostAlloc(&g_gs_h, sizeof(GuardScan), cudaHostAllocPortable));
     g_gs_h->count = 0, g_gs_h->first_p1 = 0;
+    int nd = 1, cur = 0;
+    CU(cudaGetDevice(&cur));
+    CU(cudaGetDeviceCount(&nd));
+    for (int d = 0; d < nd && d < 8; ++d) {
+        CU(cudaSetDevice(d));
+        CU(cudaMalloc(&g_gs_d[d], sizeof(GuardScan)));
+    }
+    CU(cudaSetDevice(cur));
 }
 // a block a slice of the rows; each block's partials go up as two atomics (a count, the least index) - no reduction
 // kernel, no allocation.  A block walks every row, so at most 8 (a speculative window) times one vocabulary.
@@ -2343,10 +2350,13 @@ static void guard_scan(const float* d_logits, int ld, int rows, int n) {
     if (!guard_on() || rows <= 0) return;
     guard_init();
     g_guard_failed = false;
+    int dev = 0;
+    CU(cudaGetDevice(&dev));
+    GuardScan* out = g_gs_d[dev >= 0 && dev < 8 ? dev : 0];
     const int blocks = std::min(1024, (n + 255) / 256);
-    CU(cudaMemsetAsync(g_gs_d, 0, sizeof(GuardScan), g_s));
-    guard_scan_kernel<<<blocks, 256, 0, g_s>>>(d_logits, ld, n, rows, g_gs_d);
-    CU(cudaMemcpyAsync(g_gs_h, g_gs_d, sizeof(GuardScan), cudaMemcpyDeviceToHost, g_s));
+    CU(cudaMemsetAsync(out, 0, sizeof(GuardScan), g_s));
+    guard_scan_kernel<<<blocks, 256, 0, g_s>>>(d_logits, ld, n, rows, out);
+    CU(cudaMemcpyAsync(g_gs_h, out, sizeof(GuardScan), cudaMemcpyDeviceToHost, g_s));
 }
 // after the stream's synchronisation: were the scanned rows non-finite?  (pos0: the first row's token position)
 static bool guard_check_scan(long pos0, int n) {
