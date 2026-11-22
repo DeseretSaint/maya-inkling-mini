@@ -954,6 +954,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(ik2_expert_bench tests/ik2_expert_bench.cu)
     target_link_libraries(ik2_expert_bench PRIVATE ik2_kernels)
     target_include_directories(ik2_expert_bench PRIVATE include)
+    # P4-5's speed gate: the decode dense shapes at T = 1, timed three ways (FP16 GEMM / planar Q8_0 warp-row
+    # product / the GGUF's Q8_0 blocks) - the bytes-moved argument for keeping the dense weights planar, measured
+    add_executable(ik2_dense_bench tests/ik2_dense_bench.cu)
+    target_link_libraries(ik2_dense_bench PRIVATE ik2_kernels ${_strata_gpu_blas_target})
+    target_include_directories(ik2_dense_bench PRIVATE include)
   endif()
   if((STRATA_ENABLE_CUDA AND (_mm3_archs OR NOT _mm3_filter)) OR STRATA_ENABLE_HIP)
     # (a GGUF's weights - tools/mm3/pack_gguf.py, MiniMax's Maya quants: maya-ds4's ggml block-type kernels, src/ds4/ds4_iq,

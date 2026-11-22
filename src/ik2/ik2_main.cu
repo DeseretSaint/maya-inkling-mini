@@ -87,6 +87,7 @@ static inline cudaError_t memAdviseCompat(const void* devPtr, size_t count, cuda
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <array>
 #include <numeric>
 #include <memory>
 #include <string>
@@ -437,24 +438,46 @@ T* dalloc(size_t n) {
     return p;
 }
 
+// IK2_GEMM_LOG=1: count the dense GEMMs (N, K, T) a run issues and print the table at exit.  The shapes a decode
+// token really asks for are not visible in a kernel trace (Tensile's names carry the tile, not the matrix), and the
+// tile choice here has to be made against measured shapes - which is how the planar Q8_0 default below was chosen.
+static const bool g_gemm_log = getenv("IK2_GEMM_LOG") && std::atoi(getenv("IK2_GEMM_LOG"));
+static long g_gemm_calls = 0;
+static std::map<std::array<int, 3>, std::pair<long, double>> g_gemm_shapes;
+static void gemm_log(int N, int Kd, int T, double us) {
+    if (!g_gemm_log) return;
+    static bool reg = false;
+    if (!reg) {
+        reg = true;
+        std::atexit([] {
+            std::vector<std::pair<std::pair<long, double>, std::array<int, 3>>> v;
+            for (auto& kv : g_gemm_shapes) v.push_back({kv.second, kv.first});
+            std::sort(v.begin(), v.end(), [](const auto& a, const auto& b) { return a.first.second > b.first.second; });
+            std::fprintf(stderr, "gemm log: %ld calls\n", g_gemm_calls);
+            for (auto& e : v)
+                std::fprintf(stderr, "  N=%-6d K=%-6d T=%-3d n=%-6ld %8.2f ms\n", e.second[0], e.second[1], e.second[2],
+                             e.first.first, e.first.second / 1e3);
+        });
+    }
+    auto& e = g_gemm_shapes[{N, Kd, T}];
+    ++e.first;
+    e.second += us;
+    ++g_gemm_calls;
+}
+
 // Y [T][N] (ldy) = X [T][K] FP16 . W [N][K]^T FP16, F32 sums
 void gemm16(const uint16_t* W, int N, int Kd, const uint16_t* X, int T, float* Y, int ldy, float beta = 0.0f) {
+    const double t0 = g_gemm_log ? now() : 0.0;
     const float one = 1.0f;
     CB(cublasGemmEx(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, N, T, Kd, &one, W, CUDA_R_16F, Kd, X, CUDA_R_16F, Kd, &beta, Y,
                     CUDA_R_32F, ldy, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT));
+    if (g_gemm_log) gemm_log(N, Kd, T, now() - t0);
 }
 
 uint8_t* g_stage = nullptr;   // a raw tensor on its way to its FP16 decode
 size_t g_stage_bytes = 0;
 
 bool g_dense_q8 = false;
-// IK2_DENSE_MV=1: keep a layer's dense matrices as planar Q8_0 (int8 values + FP16 block scales) *as well as* the
-// FP16 copy, and take a token's product over the planar form (k::mv_q8p, a warp a row) instead of a hipBLAS f16
-// GEMM.  A Q8_0 matrix is 34 / 32 = 1.0625 bytes a value against FP16's 2, so at T = 1 - where the GEMM's macro tile
-// is 16 rows deep and 1 is live - the product both reads half the weight bytes and skips the tensor cores.  Measured
-// (tests/ik2_dense_bench.cu, the decode shapes): 27-48% less GPU time a call than the f16 GEMM.  The FP16 copy stays
-// for T > 1 (prefill and the block path run GEMMs over it), so this costs VRAM: +0.55 GiB of dense weights here.
-bool g_dense_mv = false;
 // The KV cache in FP16 (IK2_KV=fp8: E4M3, half the bytes).  Against ref/inkling2.py over 48 tokens FP16 kept every
 // top-1 token (KL mean 8.5e-4) and FP8 changed 5 (KL 8.3e-3): Inkling's router is full of near-ties, so FP8's 1.5% in
 // layer 0's attention output already moves 7 of 48 tokens' experts.  The full layers' cache is 32 KB a token in FP16.
@@ -523,15 +546,6 @@ bool upload_planar(Mat& m, const std::vector<const uint8_t*>& parts, const std::
     return true;
 }
 
-// (IK2_DENSE_MV) the FP16 copy of a matrix that is also kept planar: T > 1's products are GEMMs over it, a token's
-// are the planar GEMV.  Built from the blocks the matrix itself holds, so the GGUF is still read once; call it after
-// upload_planar / try_load_fused_raw, never instead of them.
-void add_f16_shadow(Mat& m) {
-    if (m.f16 || !(m.q8 || m.raw)) return;
-    m.f16 = dalloc<uint16_t>((size_t) m.N * m.K);
-    if (m.q8) k::decode_q8p_f16(m.q8, m.q8d, (size_t) m.N * m.K, m.f16, g_s);
-    else k::decode_f16(m.type, m.raw, (size_t) m.N * m.K, m.f16, g_s);
-}
 
 Mat load_mat(const Shards& S, const std::string& n, int N, int Kd) {
     const auto* t = S.info(n);
@@ -4631,6 +4645,30 @@ int main(int argc, char** argv) {
         g_kv_managed = true;
         std::printf("global KV: on-demand managed pages, sliding KV in VRAM\n");
     }
+    // Which doubles the dense weights are read as: planar Q8_0 (a token's product then a warp a row over the int8
+    // values, half an FP16 copy's bytes and no tensor core for a macro tile that holds one live row), or an FP16 copy
+    // (a hipBLAS GEMM for every product).  Planar needs every dense matrix to be Q8_0 with K a multiple of 128, so it
+    // is the default only when that holds - the model is asked, not assumed - and IK2_DENSE=f16 asks for the copies.
+    // MEASURED, this card (16 GB, UD-Q4_K_XL; D16): decode 53.3 -> 64.0 tok/s at a 128-token prompt, 49.3 -> 58.1 at
+    // 16K; a 16K prefill 1622.6 -> 1528.0 tok/s (the T > 1 products decode the blocks on demand, a chunk at a time).
+    if (!getenv("IK2_DENSE")) {
+        const bool rw_layout = S.info("blk.0.ffn_gate_up_exps.weight") != nullptr;
+        const std::string b0 = "blk.0.";
+        const std::vector<std::string> need = {b0 + "attn_q.weight", b0 + "attn_k.weight", b0 + "attn_v.weight",
+                                               b0 + "attn_gate.weight", b0 + "attn_output.weight",
+                                               rw_layout ? b0 + "attn_rel.weight" : b0 + "attn_r.weight",
+                                               "output.weight"};
+        bool ok = true;
+        for (const auto& n : need) {
+            const auto* t = S.info(n);
+            if (!t || t->type != k::kQ8_0 || t->shape.empty() || (t->shape[0] % 128) != 0) {
+                ok = false;
+                break;
+            }
+        }
+        g_dense_q8 = ok;
+        std::printf("dense weights read as: %s\n", g_dense_q8 ? "planar Q8_0 (a token over the blocks)" : "FP16 copies");
+    }
     if (n_gpu == 1 && !g_pool) {
         size_t exp_b = 0, dense_b = 0, kv_b = 0;
         for (const auto& kv : S.by_name) {
@@ -4672,7 +4710,7 @@ int main(int argc, char** argv) {
         }
         const bool fits = exp_b + dense_b + kv_b + draft_b + (size_t) ctx * draft_tok + reserve <= fr0 &&
                           exp_b <= (size_t) (cache_gb * 1073741824.0);
-        if (fits && !getenv("IK2_DENSE")) g_dense_q8 = true;
+
         g_fast_want = fits && g_dense_q8 && !(getenv("IK2_FAST") && !std::atoi(getenv("IK2_FAST")));
         stage_cold = getenv("IK2_STAGE_COLD") && atoi(getenv("IK2_STAGE_COLD"));
         g_managed_experts = g_fast_want && g_kv_managed && getenv("IK2_TIER") && atoi(getenv("IK2_TIER"));

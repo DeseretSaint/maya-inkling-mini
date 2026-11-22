@@ -136,15 +136,97 @@ What this says:
 - **The expert kernels are bandwidth-bound, not arithmetic-bound.** A decode layer's expert launch
   streams 8 experts' 21.2 MB in 48 us - 442 GB/s of the card's 640, 69 % of peak. There is no
   headroom for matrix cores to recover.
-- **The dense path is the largest remaining share.** 42 % of decode is hipBLASLt f16 GEMMs, and
-  `decode_f16_nvfp4_kernel` / `decode_f16_q8_kernel` materialise f16 copies of the quantised dense
-  weights every token, adding write+read traffic on top of the original read. Fusing the dequant into
-  the GEMM tile removes that traffic without VRAM cost; a resident f16 copy would cost +1.1 GiB this
-  card does not have.
+- **The dense path was the largest remaining share, and it is fixed.** 42 % of decode was hipBLASLt
+  f16 GEMMs reading 2 bytes a weight value. The per-token dequant this profile was read as is **not**
+  happening - every `decode_f16_q8_kernel` call lands in the load, once - but the resident FP16 copy
+  it builds is what the GEMMs read. Keeping the dense weights planar Q8_0 and taking a token's product
+  straight over the blocks (`IK2_DENSE=q8`, now the default) collapses that family, see the next
+  section.
 - **Profile first.** Three optimistic kernel changes (expert WMMA, the flash-attention product,
   a decode expert-MMA dispatch) each measured inside noise end to end, for the same reason: the
   component was optimised before the decode was profiled. The measured nulls are the reason the
   matrix-core work above is described by its *kernel* speed and only claimed as a prefill lever.
+
+## The dense path: planar Q8_0 (MEASURED, +20 % decode)
+
+The fix is not a fused dequant, because there is no per-token dequant to fuse: in the decode-only
+trace all 145 `decode_f16_q8_kernel` calls fall in the first 303 ms of a 4.3 s run - they are the
+one-time load of the dense weights (9.1 ms of GPU time), not a per-token cost. What the profile really
+shows is the consequence of that load: at T = 1 every dense product is a hipBLAS f16 x f16 GEMM over
+a resident FP16 copy, reading 2 bytes a weight value, and that copy is 3.0 GiB of the card's VRAM
+against 1.59 GiB planar by the GGUF's own dense census (1,609 M dense values, 646 tensors) - 1.4 GiB the
+expert cache cannot use.
+
+**The shapes were counted, not guessed.** `IK2_GEMM_LOG=1` (kept as a diagnostic) prints the
+(N, K, T) table a run issues; one decode token asks for 221 dense products:
+
+| N | K | calls/token | what |
+| --- | --- | --- | --- |
+| 8600 | 2304 | 20 | sliding layers' fused qkvrg + sink |
+| 6552 | 2304 | 8 | full layers' fused qrgate + sink |
+| 3480 | 2304 | 20 | full layers' fused qrgate + sink, gate unfused |
+| 3072 | 2304 | 20 | full layers' `attn_q` |
+| 1056 | 2304 | 16 | `wk`/`wv` of the short-conv layers |
+| 1024 | 2304 | 40 | `attn_k` / `attn_v` |
+| 2304 | 3072 | 48 | `attn_output` |
+| 128 | 2304 | 48 | router |
+| 201024 | 2304 | 1 | head |
+
+`tests/ik2_dense_bench.cu` (`ik2_dense_bench`, built with the engine) times each shape three ways over
+the same data, 200 reps: the hipBLAS f16 GEMM, `mv_q8p` over **planar** Q8_0 (int8 values + FP16
+block scales, a warp a row), and `mv_blocks` over the GGUF's 34-byte Q8_0 blocks as they lie.
+
+| shape (N x K) | GEMM us | mvq8 us | mvraw us | rel mvq8 |
+| --- | --- | --- | --- | --- |
+| 8600 x 2304 | 46.0 | **24.2** | 47.2 | 2.9e-04 |
+| 6552 x 2304 | 23.6 | **13.6** | 20.4 | 2.9e-04 |
+| 3480 x 2304 | 13.3 | **9.2** | 15.0 | 2.9e-04 |
+| 3072 x 2304 | 12.2 | **8.6** | 14.1 | 3.0e-04 |
+| 1056 x 2304 | 8.2 | **5.4** | 8.1 | 2.9e-04 |
+| 1024 x 2304 | 8.2 | **5.3** | 8.3 | 2.8e-04 |
+| 2304 x 3072 | 12.1 | **9.2** | 12.2 | 3.0e-04 |
+| 128 x 2304 | 9.0 | **4.7** | 6.3 | 2.9e-04 |
+
+Planar Q8_0 wins every shape by 24-48 %, and over the calls a token makes it is 1910 us against the
+GEMM's 3090 us (-38 %). The raw-block form loses to the GEMM on most shapes - the blocks are read
+inefficiently by a warp-per-row loop - so *planar*, not "the GGUF's blocks as they lie", is the form
+to keep. The bench's GB/s column is inflated by the 64 MB Infinity Cache (the matrices fit in it): the
+ranking is what transfers, not the absolute rate.
+
+The engine already had this layout behind `IK2_DENSE`, but only switched to it when every expert fit in
+VRAM, which on 16 GB never happens. It is now the default whenever every dense matrix qualifies (Q8_0
+with K a multiple of 128 - the model is asked at load, not assumed), with `IK2_DENSE=f16` the opt-out.
+
+Decode, 128-token prompt, `--ctx 4096 --cache-gb 12`, 96 generated, 2 runs an arm, interleaved:
+
+| arm | run 1 | run 2 |
+| --- | --- | --- |
+| `IK2_DENSE=f16` | 52.72 | 52.87 |
+| planar Q8_0 (default) | 63.73 | 63.72 |
+
+**+20.7 % decode**, against run-to-run noise of ~1.7 % on this machine. At depth (16,384-token prompt,
+`--ctx 32768`) it is 49.27 -> 58.09 tok/s, +17.9 %, at a **-5.8 % prefill cost** (1622.6 -> 1528.0):
+with no FP16 copy, a T > 1 product decodes the matrix it needs on demand, a chunk at a time, which is
+the price of freeing 1.4 GiB. The deep preset gains headroom rather than losing it - planar is cheaper in
+VRAM, and the freed pages go to the expert cache (1867 misses against 1983 on the 16K prefill).
+
+Parity: `ik2_kernels_test` 346 ok / 0 fail; greedy ids identical over 128 generated tokens, byte for
+byte, both arms; the planar product's worst RMS difference from the GEMM is 3.0e-04, which is the f16
+copy's own rounding - planar Q8_0 is exactly the value that copy was rounded from.
+
+Kernel-level delta, `rocprofv3 --kernel-trace`, PERTURBED (1-token prompt, 16 generated, ctx 2048) -
+shares only, never throughput:
+
+| family | f16 copies | planar Q8_0 |
+| --- | --- | --- |
+| total GPU | 286.8 ms | **237.2 ms** |
+| hipBLASLt / Tensile GEMM | 111.92 ms (39.0 %), 4,304 calls | **12.82 ms (5.4 %)**, 3,584 calls |
+| `mv_q8p_kernel<4,...>` | - | 54.95 ms (23.2 %), 2,768 calls |
+| expert kernels | 88.3 ms | 92.8 ms (cache variance) |
+| `rocclr_copyBuffer` | 19.35 ms | 19.17 ms |
+
+The dense GEMM family collapses by 89 %, and the traced run's total GPU time drops 17.3 %: the
+mechanism is the dense products, and the +20.7 % is the untraced measurement.
 
 ## Not verified here
 
