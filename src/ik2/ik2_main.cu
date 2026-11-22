@@ -2269,8 +2269,141 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
     k::conv4_res(W.tmp, Ly.h_mlp, Ly.sc_mlp, nullptr, 0, T, C, r_in, h_out, g_s);
 }
 
+// ---- the logits finiteness guard (S1) -----------------------------------------------------------
+// A fault upstream (an overflow in an expert, a bad weight) leaves NaN or Inf in a token's logits row, and both of
+// the engine's token choosers then ignore it silently: every comparison against a NaN is false, so the argmax keeps
+// its sentinel and the sampler's softmax denominator comes out NaN.  The fault then surfaces as a degenerate token
+// loop that a caller cannot tell from the model repeating itself.  With the guard on (the default) one pass over the
+// rows that will choose a token catches it first: the token position, the count of non-finite logits and the first
+// offending index go to stderr, and the request fails instead of emitting tokens.  IK2_GUARD=0 restores the old
+// behaviour, for bisection.
+//
+// The scan is O(vocab) with no allocation after the first call, and it rides copies every path already makes: the
+// kernel and its 8-byte result are queued on the same stream ahead of the synchronisation that reads the token, so
+// there is no extra device sync and the happy path's token ids are unchanged.  The argmax path is the reason it is a
+// kernel and not a host loop: there the logits never reach the host (k::argmax_sum picks the token on the device), so
+// the finiteness flag has to come back as a device scalar beside the argmax.  The host path (logits already resident)
+// scans every logit, with no stride.
+static bool guard_on() {
+    static const bool on = !(getenv("IK2_GUARD") && std::atoi(getenv("IK2_GUARD")) == 0);
+    return on;
+}
+// IK2_TEST_NAN=<token position>: the guard's test hook - NaN into that position's logits row after the head computed
+// it (0: every row).  Unset, it costs one load of a static; it is the only way to make a healthy model fault on demand.
+static long guard_nan_at() {
+    static const long at = getenv("IK2_TEST_NAN") ? (long) std::atol(getenv("IK2_TEST_NAN")) : -1;
+    return at;
+}
+struct GuardScan {   // the rows scanned last: how many logits were non-finite, and the first one's index + 1 (0: none)
+    int count, first_p1;
+};
+static GuardScan* g_gs_d = nullptr;   // (the device counter, zeroed before every scan)
+static GuardScan* g_gs_h = nullptr;   // (pinned: the scan's result, read after the stream's synchronisation)
+static bool g_guard_failed = false;   // (the rows scanned last held a non-finite logit: no token may be chosen)
+static long g_guard_fail_pos = -1;    // (the position reported, the count, the first offending index)
+static int g_guard_fail_count = 0, g_guard_fail_first = -1;
+
+// (isfinite as arithmetic: HIP's header declares the library one for device code only, and this runs on both sides)
+static __host__ __device__ inline bool guard_finite(float v) { return v == v && v > -INFINITY && v < INFINITY; }
+
+static void guard_init() {
+    if (g_gs_d) return;
+    CU(cudaMalloc(&g_gs_d, sizeof(GuardScan)));
+    CU(cudaHostAlloc(&g_gs_h, sizeof(GuardScan), cudaHostAllocPortable));
+    g_gs_h->count = 0, g_gs_h->first_p1 = 0;
+}
+// a block a slice of the rows; each block's partials go up as two atomics (a count, the least index) - no reduction
+// kernel, no allocation.  A block walks every row, so at most 8 (a speculative window) times one vocabulary.
+__global__ void guard_scan_kernel(const float* x, int ld, int n, int rows, GuardScan* out) {
+    int count = 0, first = 0x7fffffff;
+    for (int r = 0; r < rows; ++r) {
+        const float* row = x + (size_t) r * ld;
+        for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
+            const float v = __ldg(row + i);
+            if (!guard_finite(v)) ++count, first = first < r * n + i ? first : r * n + i;
+        }
+    }
+    for (int o = 16; o > 0; o >>= 1) {   // (the block's partials, then the grid's two atomics)
+        count += __shfl_xor_sync(0xffffffffu, count, o);
+        const int of = __shfl_xor_sync(0xffffffffu, first, o);
+        first = first < of ? first : of;
+    }
+    __shared__ int sc[32], sf[32];
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, nw = (blockDim.x + 31) >> 5;
+    if (lane == 0) sc[warp] = count, sf[warp] = first;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        int c = 0, f = 0x7fffffff;
+        for (int i = 0; i < nw; ++i) c += sc[i], f = f < sf[i] ? f : sf[i];
+        if (c) atomicAdd(&out->count, c), atomicMin(&out->first_p1, f + 1);
+    }
+}
+// the rows just computed, queued for the scan: call after the head's product and before any token is chosen
+static void guard_scan(const float* d_logits, int ld, int rows, int n) {
+    if (!guard_on() || rows <= 0) return;
+    guard_init();
+    g_guard_failed = false;
+    const int blocks = std::min(1024, (n + 255) / 256);
+    CU(cudaMemsetAsync(g_gs_d, 0, sizeof(GuardScan), g_s));
+    guard_scan_kernel<<<blocks, 256, 0, g_s>>>(d_logits, ld, n, rows, g_gs_d);
+    CU(cudaMemcpyAsync(g_gs_h, g_gs_d, sizeof(GuardScan), cudaMemcpyDeviceToHost, g_s));
+}
+// after the stream's synchronisation: were the scanned rows non-finite?  (pos0: the first row's token position)
+static bool guard_check_scan(long pos0, int n) {
+    if (!guard_on() || g_gs_h->count == 0) return false;
+    const int first = g_gs_h->first_p1 - 1, row = first / n, col = first % n;
+    g_guard_failed = true;
+    g_guard_fail_pos = pos0 + row, g_guard_fail_count = g_gs_h->count, g_guard_fail_first = col;
+    std::fprintf(stderr,
+                 "maya-ik2: logits guard: token position %ld: %d non-finite logit%s, first at index %d - not sampling\n",
+                 g_guard_fail_pos, g_gs_h->count, g_gs_h->count == 1 ? "" : "s", col);
+    std::fflush(stderr);
+    g_gs_h->count = 0;
+    return true;
+}
+// a row that is already on the host (the paths that copy logits out): every logit, no stride
+static bool guard_check_host(const float* r, int n, long pos, const char* where) {
+    if (!guard_on()) return false;
+    int count = 0, first = -1;
+    for (int i = 0; i < n; ++i)
+        if (!guard_finite(r[i])) {
+            if (first < 0) first = i;
+            ++count;
+        }
+    if (!count) return false;
+    g_guard_failed = true;
+    g_guard_fail_pos = pos, g_guard_fail_count = count, g_guard_fail_first = first;
+    std::fprintf(stderr, "maya-ik2: logits guard: token position %ld (%s): %d non-finite logit%s, first at index %d "
+                         "- not sampling\n",
+                 pos, where, count, count == 1 ? "" : "s", first);
+    std::fflush(stderr);
+    return true;
+}
+// the request layer's report (the one-shot CLI exits 2; --serve answers the request on its ERR line)
+static void guard_report_request() {
+    std::fprintf(stderr,
+                 "maya-ik2: logits guard: the request failed: token position %ld produced %d non-finite logit(s), "
+                 "first at index %d (IK2_GUARD=0 samples anyway)\n",
+                 g_guard_fail_pos, g_guard_fail_count, g_guard_fail_first);
+    std::fflush(stderr);
+}
+// IK2_TEST_NAN, the test hook: NaN into the first, middle and 1000th logit of the rows at position `at` (0: all rows)
+static void guard_inject_nan(float* d_logits, int ld, int rows, int n, long pos0) {
+    const long at = guard_nan_at();
+    if (at < 0) return;
+    static const float nanv = nanf("");
+    static const int at_i[3] = {5, 7, 1000};
+    for (int r = 0; r < rows; ++r) {
+        const long pos = pos0 + r;
+        if (at != 0 && pos != at) continue;
+        float* row = d_logits + (size_t) r * ld;
+        for (int k = 0; k < 3; ++k)
+            if (at_i[k] < n) CU(cudaMemcpyAsync(row + at_i[k], &nanv, 4, cudaMemcpyHostToDevice, g_s));
+    }
+}
+
 void run_head(const Model& M, int T, bool all_logits, OutMode out_mode, int nb, const float* h_in, Work& W,
-              std::vector<float>& logits_out, std::vector<int>* argmax_out) {
+              int pos0, std::vector<float>& logits_out, std::vector<int>* argmax_out) {
     const Config& c = M.c;
     const int C = c.C;
     const size_t TC = (size_t) T * C;
@@ -2301,16 +2434,23 @@ void run_head(const Model& M, int T, bool all_logits, OutMode out_mode, int nb, 
                 for (int i = 0; i < nt; i += 16) {
                     const int n = std::min(16, nt - i);
                     matmul(M.out_w, W.xq + (size_t) (t0 + i) * C, W.x16 + (size_t) i * C, n, W.logits, c.n_rows);
+                    if (nt <= 16) {   // (the chunk that picks the next token: W.logits is reused per 16 rows)
+                        guard_inject_nan(W.logits, c.n_rows, n, c.n_vocab, pos0 + t0 + i);
+                        guard_scan(W.logits, c.n_rows, n, c.n_vocab);
+                    }
                     if (n == 1) k::argmax_sum(W.logits, nullptr, nullptr, c.n_vocab, W.argmax_d + i, g_s);
                     else k::argmax_rows(W.logits, c.n_rows, n, c.n_vocab, W.argmax_d + i, g_s);
                 }
                 CU(cudaMemcpyAsync(W.argmax_h, W.argmax_d, (size_t) nt * 4, cudaMemcpyDeviceToHost, g_s));
                 CU(cudaStreamSynchronize(g_s));
+                if (nt <= 16) guard_check_scan(pos0 + t0, c.n_vocab);
                 for (int i = 0; i < nt; ++i) (*argmax_out)[i] = W.argmax_h[i];
             } else {
+                const size_t at0 = logits_out.size();
                 for (int i = 0; i < nt; i += 16) {   // (W.logits holds 16 rows)
                     const int n = std::min(16, nt - i);
                     matmul(M.out_w, W.xq + (size_t) (t0 + i) * C, W.x16 + (size_t) i * C, n, W.logits, c.n_rows);
+                    guard_inject_nan(W.logits, c.n_rows, n, c.n_vocab, pos0 + t0 + i);
                     k::softcap(W.logits, (size_t) n * c.n_rows, c.logit_cap, g_s);
                     const size_t at = logits_out.size();
                     logits_out.resize(at + (size_t) n * c.n_vocab);
@@ -2319,6 +2459,11 @@ void run_head(const Model& M, int T, bool all_logits, OutMode out_mode, int nb, 
                                          g_s));
                 }
                 CU(cudaStreamSynchronize(g_s));
+                for (int i = 0; i < nt; ++i) {   // (the rows are on the host: every logit, no stride)
+                    if (guard_check_host(logits_out.data() + at0 + (size_t) i * c.n_vocab, c.n_vocab, pos0 + t0 + i,
+                                         "logits row"))
+                        break;
+                }
             }
         }
     }
@@ -2541,7 +2686,7 @@ __global__ void stage_selected_experts(const uint8_t* const* table, const uint8_
         selected[slot] = (const uint8_t*)dst;
 }
 
-void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
+void fast_token_launches(Model& M, Work& W, OutMode out_mode, int pos) {
     const Config& c = M.c;
     const int C = c.C, HD = c.H * c.D, KD = c.KV * c.D, HR = c.H * c.d_rel;
     const size_t Cb = (size_t) C * 4;
@@ -2777,6 +2922,8 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         if (g_taps)
             CU(cudaMemcpyAsync(g_taps + (size_t) g_final_tap * g_taps_ld * C, W.xq, Cb, cudaMemcpyDeviceToDevice, g_s));
         mv1(M.out_w, W.xq, W.logits);
+        guard_inject_nan(W.logits, c.n_rows, 1, c.n_vocab, pos);
+        guard_scan(W.logits, c.n_rows, 1, c.n_vocab);
         if (out_mode == OutMode::kArgmax) {
             k::argmax_sum(W.logits, nullptr, nullptr, c.n_vocab, W.argmax_d, g_s);
             CU(cudaMemcpyAsync(W.argmax_h, W.argmax_d, 4, cudaMemcpyDeviceToHost, g_s));
@@ -2800,19 +2947,20 @@ void fast_token(Model& M, int tok, int pos, OutMode out_mode, std::vector<float>
     k::decode_host(M.embd_type, M.embd + (size_t) tok * rb, c.C, W.emb_h);
     W.pos_h[0] = pos;
     if (!g_graph) {
-        fast_token_launches(M, W, out_mode);
+        fast_token_launches(M, W, out_mode, pos);
     } else {
         FastGraph& G =
             g_fgraph[(tier_active && (stage_cold || !host_plan.active.empty())) || host_plan.forced][(int)out_mode];
         if (!G.exec) {   // the first token of this kind: its launches recorded
             CU(cudaStreamBeginCapture(g_s, cudaStreamCaptureModeGlobal));
-            fast_token_launches(M, W, out_mode);
+            fast_token_launches(M, W, out_mode, pos);
             CU(cudaStreamEndCapture(g_s, &G.graph));
             CU(cudaGraphInstantiate(&G.exec, G.graph, 0));
         }
         CU(cudaGraphLaunch(G.exec, g_s));
     }
     CU(cudaStreamSynchronize(g_s));
+    guard_check_scan(pos, c.n_vocab);
     if (out_mode == OutMode::kArgmax) {
         argmax_out->assign(1, W.argmax_h[0]);
     } else if (out_mode == OutMode::kLogits) {
@@ -2886,7 +3034,7 @@ void tile_rows(const Mat& m, int r0, int n, const uint16_t* x16, int T, float* y
     k::q8_tile(m.q8 + (size_t) r0 * m.K, m.q8d + (size_t) r0 * (m.K >> 5), n, m.K, x16, T, y, ldy, g_s);
 }
 
-void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
+void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode, int pos0) {
     const Config& c = M.c;
     const int C = c.C, HD = c.H * c.D, KD = c.KV * c.D, HR = c.H * c.d_rel, S = T * c.K;
     const size_t TC = (size_t) T * C, TCb = TC * 4;
@@ -3071,6 +3219,8 @@ void fast_block_launches(Model& M, Work& W, int T, OutMode out_mode) {
         if (g_taps)
             CU(cudaMemcpyAsync(g_taps + (size_t) g_final_tap * g_taps_ld * C, W.xq, TCb, cudaMemcpyDeviceToDevice, g_s));
         tile_rows(M.out_w, 0, c.n_rows, W.x16, T, W.logits, c.n_rows);
+        guard_inject_nan(W.logits, c.n_rows, T, c.n_vocab, pos0);
+        guard_scan(W.logits, c.n_rows, T, c.n_vocab);
         if (out_mode == OutMode::kArgmax) {
             k::argmax_rows(W.logits, c.n_rows, T, c.n_vocab, W.argmax_d, g_s);
             CU(cudaMemcpyAsync(W.argmax_h, W.argmax_d, (size_t) T * 4, cudaMemcpyDeviceToHost, g_s));
@@ -3104,18 +3254,19 @@ void fast_block(Model& M, const int* tok, int T, int pos0, OutMode out_mode, std
         g_blk.pos_h[t] = pos0 + t;
     }
     if (!g_graph) {
-        fast_block_launches(M, W, T, out_mode);
+        fast_block_launches(M, W, T, out_mode, pos0);
     } else {
         FastGraph& G = g_bgraph[T][(int) out_mode];
         if (!G.exec) {
             CU(cudaStreamBeginCapture(g_s, cudaStreamCaptureModeGlobal));
-            fast_block_launches(M, W, T, out_mode);
+            fast_block_launches(M, W, T, out_mode, pos0);
             CU(cudaStreamEndCapture(g_s, &G.graph));
             CU(cudaGraphInstantiate(&G.exec, G.graph, 0));
         }
         CU(cudaGraphLaunch(G.exec, g_s));
     }
     CU(cudaStreamSynchronize(g_s));
+    guard_check_scan(pos0, c.n_vocab);
     if (out_mode == OutMode::kArgmax) {
         argmax_out->assign(W.argmax_h, W.argmax_h + T);
     } else if (out_mode == OutMode::kLogits) {
@@ -3917,7 +4068,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
         g_pf.lap(g_pf.rest);
         dump_f("blk." + std::to_string(vis) + ".out", W.h, TC);
     }
-    run_head(M, T, all_logits, out_mode, nb, W.h, W, logits_out, argmax_out);
+    run_head(M, T, all_logits, out_mode, nb, W.h, W, pos0, logits_out, argmax_out);
 #undef W
 #undef EC
 }
@@ -4156,11 +4307,14 @@ void forward_prefill_sup(Model& M, const int* tok, int T, int pos0, int sub_chun
         outs.y32[0] = g_dense_q8 ? W.xq : nullptr;
         k::attn_res_rms_f16(st, nb + 1, M.out_res_score, 1, 1, C, 1e-6f, c.eps, outs, g_s);
         matmul(M.out_w, W.xq, W.x16, 1, W.logits, c.n_rows);
+        guard_inject_nan(W.logits, c.n_rows, 1, c.n_vocab, pos0 + last);
+        guard_scan(W.logits, c.n_rows, 1, c.n_vocab);
         if (out_mode == OutMode::kArgmax) {
             argmax_out->resize(1);
             k::argmax_sum(W.logits, nullptr, nullptr, c.n_vocab, W.argmax_d, g_s);
             CU(cudaMemcpyAsync(W.argmax_h, W.argmax_d, 4, cudaMemcpyDeviceToHost, g_s));
             CU(cudaStreamSynchronize(g_s));
+            guard_check_scan(pos0 + last, c.n_vocab);
             (*argmax_out)[0] = W.argmax_h[0];
         } else {
             k::softcap(W.logits, (size_t) c.n_rows, c.logit_cap, g_s);
@@ -4168,6 +4322,7 @@ void forward_prefill_sup(Model& M, const int* tok, int T, int pos0, int sub_chun
             logits_out.resize(at + (size_t) c.n_vocab);
             CU(cudaMemcpyAsync(logits_out.data() + at, W.logits, (size_t) c.n_vocab * 4, cudaMemcpyDeviceToHost, g_s));
             CU(cudaStreamSynchronize(g_s));
+            guard_check_scan(pos0 + last, c.n_vocab);
         }
         g_pf.lap(g_pf.rest);
     } else {
@@ -4443,6 +4598,7 @@ int main(int argc, char** argv) {
         else if (a == "--dump") dump = next();
         else die("unknown argument " + a);
     }
+    if (guard_on()) guard_init();   // (before any capture: the scan's launch is recorded into the token graph)
     g_prof = getenv("IK2_PROF") && std::atoi(getenv("IK2_PROF")) == 1;
     g_prof2 = getenv("IK2_PROF") && std::atoi(getenv("IK2_PROF")) == 2;
     g_tier_graph = getenv("IK2_GRAPH") && !g_fast_want ? std::atoi(getenv("IK2_GRAPH")) : 0;
@@ -5820,6 +5976,15 @@ int main(int argc, char** argv) {
                 busy = false;
                 continue;
             }
+            if (g_guard_failed) {   // (the prompt's last row is non-finite: the request cannot be served)
+                guard_report_request();
+                std::printf("ERR %s\nDONE 0 %zu 0 0 cancel 0 0 0\n", "non-finite logits", ids.size());
+                std::fflush(stdout);
+                reset();   // (a bad row means the cached state is not trusted - what Strata's guard does too)
+                g_guard_failed = false;
+                busy = false;
+                continue;
+            }
             if (L < ids.size()) {
                 hist = ids;
                 hist_sig = sig;
@@ -5895,6 +6060,10 @@ int main(int argc, char** argv) {
             SuffixStats suffix_stats;
             size_t next_placement = hist.size() + kPlacementInterval;
             for (int i = 0; i < max_new; ++i) {
+                if (g_guard_failed) {   // (checked before the choice: a non-finite row never becomes a token)
+                    reason = "non-finite logits";
+                    break;
+                }
                 if (g_managed_experts && hist.size() >= next_placement) {
                     place_decode(M, (int)hist.size());
                     next_placement = hist.size() + kPlacementInterval;
@@ -5920,6 +6089,7 @@ int main(int argc, char** argv) {
                     std::vector<int> next;
                     const int n =
                         verify_suffix(M, hist, tok, max_new - i - 1, stops, next, t_exp, suffix_stats, suffix_sample);
+                    if (g_guard_failed) break;   // (a verified row is non-finite: the request ends below)
                     if (n) {
                         hist.push_back(tok);
                         if (g_cancel) {
@@ -5952,6 +6122,10 @@ int main(int argc, char** argv) {
                     const double ts = now();
                     spec_step(M, drafter, tok, (int) hist.size(), B, sc, stops, next);
                     CU(cudaStreamSynchronize(g_s));
+                    if (g_guard_failed) {   // (a window row is non-finite: none of its tokens is kept)
+                        reason = "non-finite logits";
+                        break;
+                    }
                     sctl.took_spec(B, (int) next.size() - 1, now() - ts);
                     hist.push_back(tok);
                     for (size_t j = 0; j + 1 < next.size(); ++j) {
@@ -5992,6 +6166,17 @@ int main(int argc, char** argv) {
                     sctl.took_plain(now() - tp0);
                 }
                 hist.push_back(tok);
+            }
+            if (g_guard_failed) {
+                guard_report_request();
+                std::printf("ERR %s\n", "non-finite logits");
+                std::printf("DONE %d %zu %.1f %.1f cancel 0 0 %d\n", n_out, ids.size(), (t1 - t0) * 1e3,
+                            (now() - t1) * 1e3, cached);
+                std::fflush(stdout);
+                reset();   // (the cached state is dropped: the fault may have poisoned it)
+                g_guard_failed = false;
+                busy = false;
+                continue;
             }
             if (suffix_stats.forwards)
                 std::fprintf(stderr, "suffix: %d target forwards verified %d inputs, accepted %d/%d proposals\n",
@@ -6076,6 +6261,11 @@ int main(int argc, char** argv) {
         first_best = (int) (std::max_element(r_last, r_last + c.n_vocab) - r_last);
         logits.clear();
     }
+    if (g_guard_failed) {   // (the prompt's last row is non-finite: no token may be emitted from it)
+        guard_report_request();
+        std::fflush(stdout);
+        std::exit(2);
+    }
     if (gen) place_decode(M, (int)prompt.size());
     // greedy generation
     g_pf = Prof{};
@@ -6125,6 +6315,11 @@ int main(int argc, char** argv) {
             std::vector<int> next;
             const int n =
                 i < suffix_at ? 0 : verify_suffix(M, suffix_hist, tok, gen - i - 1, {}, next, t_exp, suffix_stats);
+            if (g_guard_failed) {   // (the verified window's rows are non-finite: nothing of it is emitted)
+                guard_report_request();
+                std::fflush(stdout);
+                std::exit(2);
+            }
             suffix_hist.push_back(tok);
             if (n) {
                 for (int j = 0; j < n - 1; ++j) {
@@ -6142,6 +6337,11 @@ int main(int argc, char** argv) {
         if (lo) logits.clear();
         forward(M, &tok, 1, (int) prompt.size() + i, false, lo ? OutMode::kLogits : OutMode::kArgmax, std::string(),
                 logits, &ag, t_exp);
+        if (g_guard_failed) {   // (the row that would pick the next token is non-finite: stop, emit nothing more)
+            guard_report_request();
+            std::fflush(stdout);
+            std::exit(2);
+        }
         if (lo) {
             std::fwrite(logits.data(), sizeof(float), (size_t) c.n_vocab, lo);
             best = (int) (std::max_element(logits.begin(), logits.begin() + c.n_vocab) - logits.begin());
