@@ -125,6 +125,14 @@ void moe_combine(const uint16_t* y, const int* inv, const float* wt, int T, int 
 /// expert's values are its true ones over its scale) -> h FP16; y [rows][C] F32.
 void swiglu_cap_f32(const float* gu, int n, int F, const float* sg, const float* su, float gcap, float ucap,
                     uint16_t* h, cudaStream_t s);
+/// The fused prefill epilogue: h [rows][F] FP16 straight from the gate/up product, so no [rows][2 F] F32
+/// scratch is written. w16 [2 F][C] FP16 (gate rows 0..F-1, up rows F..2 F-1), x [rows][x_ld] FP16,
+/// h [rows][h_ld] FP16 (h_ld = F: contiguous). sg/su are the rows' expert scales, indexed from row 0.
+/// The arithmetic is swiglu_cap_pair on an FP32 sum taken in 64-value blocks (ik2::dot_f16_f32's order);
+/// only the summation order differs from gemm16 + swiglu_cap_f32. fits: C % 64 == 0 and F % 8 == 0.
+bool gate_up_swiglu_f16_fits(int C, int F);
+void gate_up_swiglu_f16(const uint16_t* w16, int C, int F, const uint16_t* x, int x_ld, int rows, const float* sg,
+                        const float* su, float gcap, float ucap, uint16_t* h, int h_ld, cudaStream_t s);
 void moe_combine_f32(const float* y, const int* inv, const float* wt, int T, int K, int C, float* out, bool add,
                      cudaStream_t s);
 /// One token's moe_combine_f32 and the conv4_res after it in one launch: out [C] = conv4(sum_k wt[k] y[inv[k]])

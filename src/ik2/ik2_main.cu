@@ -2077,6 +2077,12 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
         g_pf.lap(g_pf.upload);
 
         static const bool batch_prefill = getenv("IK2_BATCH_PREFILL") && atoi(getenv("IK2_BATCH_PREFILL"));
+        // IK2_FUSE_SWIGLU: the prefill batch's gate/up GEMM applies the capped SwiGLU in its epilogue, so the
+        // [S][2 F] FP32 gate/up scratch is never written or read back (ik2_kernels.cu's
+        // gate_up_swiglu_f16_kernel). Off by default until the GPU validation card proves its ids and its
+        // speed; 1 turns it on, 0 is the old gemm16 + swiglu_cap_f32 pair (the A/B and the bisect).
+        static const bool fuse_swiglu_want = getenv("IK2_FUSE_SWIGLU") && atoi(getenv("IK2_FUSE_SWIGLU"));
+        const bool fuse_swiglu = fuse_swiglu_want && k::gate_up_swiglu_f16_fits(C, F);
         const bool batch = batch_prefill && d == -1 && !Ly.tab_h.empty() && n_miss == 0 && T >= 64 && C % 8 == 0 &&
                            (size_t)S * (2 * std::max(C, F) + 4 * C) <= X.lg_cap * 4 &&
                            (size_t)S * 2 * F * sizeof(float) <= X.gu32_bytes;
@@ -2089,7 +2095,7 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
         CU(cudaMemcpyAsync(X.sg, sg, (size_t) S * 4, cudaMemcpyHostToDevice, g_s));
         CU(cudaMemcpyAsync(X.su, su, (size_t) S * 4, cudaMemcpyHostToDevice, g_s));
         CU(cudaMemcpyAsync(X.wtr, wtr, (size_t) S * 4, cudaMemcpyHostToDevice, g_s));
-        auto gate_up_product = [&](int e, const uint16_t* input, float* output) {
+        auto gate_up_weights = [&](int e) {   // this expert's gate/up rows -> X.w16 FP16, [2 F][C]
             const uint8_t* blob = X.slot_ptrs[e];
             if (Ly.ty[0] == Ly.ty[1]) {
                 k::decode_f16(Ly.ty[0], blob, (size_t)2 * F * C, X.w16, g_s);
@@ -2097,6 +2103,9 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
                 k::decode_f16(Ly.ty[0], blob, (size_t)F * C, X.w16, g_s);
                 k::decode_f16(Ly.ty[1], blob + Ly.eb[0], (size_t)F * C, X.w16 + (size_t)F * C, g_s);
             }
+        };
+        auto gate_up_product = [&](int e, const uint16_t* input, float* output) {
+            gate_up_weights(e);
             gemm16(X.w16, 2 * F, C, input, W.cnt[e], output, 2 * F);
         };
         auto down_product = [&](int e, const uint16_t* hidden, float* output) {
@@ -2109,14 +2118,30 @@ void run_prefill_moe(const Model& M, Layer& Ly, int l, int T, const uint16_t* xq
             uint16_t* sorted_input = (uint16_t*)X.lg;
             float* sorted_out = (float*)(sorted_input + (size_t)S * std::max(C, F));
             gather_f16_16_kernel<<<S, 256, 0, g_s>>>(xin, X.gidx, S, C, sorted_input);
-            for (int e : X.hit_exps) {
-                const size_t offset = W.start[e];
-                gate_up_product(e, sorted_input + offset * C, X.gu32 + offset * 2 * F);
-            }
-            k::swiglu_cap_f32(X.gu32, S, F, X.sg, X.su, c.gate_cap, c.up_cap, sorted_input, g_s);
-            for (int e : X.hit_exps) {
-                const size_t offset = W.start[e];
-                down_product(e, sorted_input + offset * F, sorted_out + offset * C);
+            if (fuse_swiglu) {
+                // The gate/up GEMM applies the activation itself (k::gate_up_swiglu_f16): nothing writes an
+                // [S][2 F] FP32 gate/up pair, so the scratch is lent as the FP16 hidden rows instead.
+                uint16_t* sorted_h = (uint16_t*)X.gu32;   // (S * F * 2 B <= gu32_bytes: the same carve)
+                for (int e : X.hit_exps) {
+                    const size_t offset = W.start[e];
+                    gate_up_weights(e);
+                    k::gate_up_swiglu_f16(X.w16, C, F, sorted_input + offset * C, C, W.cnt[e], X.sg + offset,
+                                          X.su + offset, c.gate_cap, c.up_cap, sorted_h + offset * F, F, g_s);
+                }
+                for (int e : X.hit_exps) {
+                    const size_t offset = W.start[e];
+                    down_product(e, sorted_h + offset * F, sorted_out + offset * C);
+                }
+            } else {
+                for (int e : X.hit_exps) {
+                    const size_t offset = W.start[e];
+                    gate_up_product(e, sorted_input + offset * C, X.gu32 + offset * 2 * F);
+                }
+                k::swiglu_cap_f32(X.gu32, S, F, X.sg, X.su, c.gate_cap, c.up_cap, sorted_input, g_s);
+                for (int e : X.hit_exps) {
+                    const size_t offset = W.start[e];
+                    down_product(e, sorted_input + offset * F, sorted_out + offset * C);
+                }
             }
             combine_prefill_groups<<<T, 256, 0, g_s>>>(sorted_out, X.inv, X.wtr, C, c.K, X.tmp);
             X.pf_layers[l % Work::kPfRing] = -1;
