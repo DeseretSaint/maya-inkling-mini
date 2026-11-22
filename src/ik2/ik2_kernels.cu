@@ -87,6 +87,68 @@ __host__ __device__ __forceinline__ uint8_t f32_to_e4m3fn(float v) {
     return sign | (uint8_t) (((ax + 0x7FFFFu + lsb) >> 20) - (120u << 3));
 #endif
 }
+// ---- fp8 E4M3FN -> half: the scalar bit-twiddle (the reference, unchanged) and IK2_FP8_FAST ----
+//
+// `__CUDA_ARCH__` is an NVIDIA macro; HIP never defines it, so on gfx1201 every fp8 KV byte used to take the
+// software branch below (a shift/mask/exponent rebuild per element). gfx1201 does have the OCP fp8
+// conversion instructions -- measured from clang's target features for --offload-arch=gfx1201:
+// +fp8-conversion-insts,+ocp-fp8-conversion-insts -- so one `v_cvt_pk_f32_fp8` turns two bytes into two f32.
+// There is no fp8 -> f16 instruction on gfx1201 (`v_cvt_pk_f16_fp8` needs gfx1250-insts), so the two-at-a-time
+// path converts the packed pair and packs it back with `v_cvt_pk_f16_f32`: the result is a half2, and the
+// kernels that only need the half (the unpack) never widen an element. A HIP target without those
+// instructions reads the 256-entry LUT below instead (one lookup per byte, generated at compile time from the
+// scalar path). All routes are bit-identical to the scalar path -- the two E4M3FN NaNs included -- and
+// tests/ik2_kernels_test.cu checks that for all 256 byte values.
+//
+// The fast path is a build flag: -DIK2_FP8_FAST=ON (CMake -DIK2_FP8_FAST=ON). Default OFF: the shipping path
+// is the code that was here before, unchanged.
+#ifndef IK2_FP8_FAST
+#define IK2_FP8_FAST 0
+#endif
+
+// the scalar path as pure integer arithmetic: the reference, the LUT's source, and the host pass's version
+__host__ __device__ __forceinline__ constexpr uint16_t e4m3fn_to_f16_bits(uint8_t q) {
+    const uint16_t sign = (uint16_t) (q & 0x80u) << 8;
+    const uint32_t mag = q & 0x7Fu;
+    if (mag == 0x7Fu) return sign | 0x7FFFu;
+    if (mag < 8u) {
+        constexpr uint16_t kSub[8] = {0x0000u, 0x1800u, 0x1C00u, 0x1E00u, 0x2000u, 0x2100u, 0x2200u, 0x2300u};
+        return sign | kSub[mag];
+    }
+    return sign | (uint16_t) ((mag << 7) + 0x2000u);
+}
+
+// the 256-entry LUT: E4M3FN byte -> the half bits the scalar path gives it (compile time, no host init)
+struct Fp8ToF16Lut {
+    uint16_t v[256];
+};
+constexpr Fp8ToF16Lut make_fp8_to_f16_lut() {
+    Fp8ToF16Lut t{};
+    for (unsigned i = 0; i < 256; ++i) t.v[i] = e4m3fn_to_f16_bits((uint8_t) i);
+    return t;
+}
+constexpr Fp8ToF16Lut kFp8ToF16Lut = make_fp8_to_f16_lut();
+
+// two bytes -> one half2's bits, by lookup (the no-instruction fallback; the LUT is already bit-exact)
+__device__ __forceinline__ uint32_t fp8_lut_x2(uint16_t p2) {
+    return (uint32_t) kFp8ToF16Lut.v[p2 & 0xFFu] | ((uint32_t) kFp8ToF16Lut.v[p2 >> 8] << 16);
+}
+
+// The hardware conversion raises a generic qNaN for the two E4M3FN NaNs; the scalar path gives sign|0x7FFF.
+// One three-instruction test per pair ((7 bits all ones) + 1 -> bit 7 set) and a branch that never runs on a
+// real KV cache keeps the conversion bit-identical.
+__device__ __forceinline__ uint32_t fp8_nan_bits(uint32_t p2) {
+    return ((p2 & 0x7F7Fu) + 0x0101u) & 0x8080u;
+}
+__device__ __forceinline__ uint32_t fp8_nan_fix_h2(uint16_t p2, uint32_t h2_bits) {
+    const uint32_t nan = fp8_nan_bits((uint32_t) p2);
+    if (nan) {
+        if (nan & 0x0080u) h2_bits = (h2_bits & 0xFFFF0000u) | ((((uint32_t) p2 & 0x80u) << 8) | 0x7FFFu);
+        if (nan & 0x8000u) h2_bits = (h2_bits & 0xFFFFu) | ((((((uint32_t) p2 >> 8) & 0x80u) << 8) | 0x7FFFu) << 16);
+    }
+    return h2_bits;
+}
+
 __device__ __forceinline__ uint16_t f32x2_to_e4m3fnx2(float a, float b) {
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
     return (uint16_t) __nv_cvt_float2_to_fp8x2(make_float2(a, b), __NV_SATFINITE, __NV_E4M3);
@@ -95,6 +157,8 @@ __device__ __forceinline__ uint16_t f32x2_to_e4m3fnx2(float a, float b) {
 #endif
 }
 __host__ __device__ __forceinline__ uint16_t e4m3fn_to_f16(uint8_t q) {
+    // one element, no neighbour to pair with (the scalar unpack's tail): the twiddle stays -- it is this short,
+    // and the hot loops all convert pairs (e4m3fnx2_to_h2_u32 / e4m3fnx2_to_f2 below)
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
     return __half_as_ushort(__half(__nv_cvt_fp8_to_halfraw((__nv_fp8_storage_t) q, __NV_E4M3)));
 #else
@@ -113,7 +177,19 @@ __host__ __device__ __forceinline__ uint16_t e4m3fn_to_f16(uint8_t q) {
 #endif
 }
 __device__ __forceinline__ uint32_t e4m3fnx2_to_h2_u32(uint16_t p2) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+#if IK2_FP8_FAST && defined(__HIP_DEVICE_COMPILE__)
+    if constexpr (__builtin_amdgcn_is_invocable(__builtin_amdgcn_cvt_pk_f32_fp8)) {
+        // v_cvt_pk_f32_fp8 (two bytes -> two f32), then v_cvt_pk_f16_f32: one half2, no per-element widening
+        typedef float ik2_f32x2 __attribute__((ext_vector_type(2)));
+        const ik2_f32x2 f = __builtin_amdgcn_cvt_pk_f32_fp8((uint32_t) p2, false);
+        const __half2 h2 = __float22half2_rn(make_float2(f[0], f[1]));
+        return fp8_nan_fix_h2(p2, (uint32_t) __half_as_ushort(__low2half(h2)) |
+                                      ((uint32_t) __half_as_ushort(__high2half(h2)) << 16));
+    }
+    return fp8_lut_x2(p2);   // a HIP target without the fp8 conversion instructions
+#elif IK2_FP8_FAST
+    return fp8_lut_x2(p2);   // CUDA's own fast path is below; everything else looks the byte up
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
     const __half2 h2 = __half2(__nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t) p2, __NV_E4M3));
     return (uint32_t) __half_as_ushort(__low2half(h2)) | ((uint32_t) __half_as_ushort(__high2half(h2)) << 16);
 #else
@@ -129,7 +205,22 @@ __host__ __device__ __forceinline__ float e4m3fn_to_f32(uint8_t q) {
 #endif
 }
 __device__ __forceinline__ float2 e4m3fnx2_to_f2(uint16_t p2) {
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
+#if IK2_FP8_FAST && defined(__HIP_DEVICE_COMPILE__)
+    if constexpr (__builtin_amdgcn_is_invocable(__builtin_amdgcn_cvt_pk_f32_fp8)) {
+        typedef float ik2_f32x2 __attribute__((ext_vector_type(2)));
+        const ik2_f32x2 f = __builtin_amdgcn_cvt_pk_f32_fp8((uint32_t) p2, false);
+        float2 r = make_float2(f[0], f[1]);
+        const uint32_t nan = fp8_nan_bits((uint32_t) p2);
+        if (nan) {   // the scalar path's NaN payloads: half 0x7FFF -> f32 0x7FFFE000, half 0xFFFF -> 0xFFFFE000
+            if (nan & 0x0080u) r.x = bits_to_float(0x7FFFE000u);
+            if (nan & 0x8000u) r.y = bits_to_float(0xFFFFE000u);
+        }
+        return r;
+    }
+    return u32_to_f2(fp8_lut_x2(p2));
+#elif IK2_FP8_FAST
+    return u32_to_f2(fp8_lut_x2(p2));
+#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= 890
     return __half22float2(__half2(__nv_cvt_fp8x2_to_halfraw2((__nv_fp8x2_storage_t) p2, __NV_E4M3)));
 #else
     return u32_to_f2(e4m3fnx2_to_h2_u32(p2));
@@ -4073,6 +4164,20 @@ __device__ __forceinline__ float4 v_load4<uint16_t>(const uint16_t* vr, int lane
 template <>
 __device__ __forceinline__ float4 v_load4<uint8_t>(const uint8_t* vr, int lane) {
     const int o = lane * 4;
+#if IK2_FP8_FAST
+    // one 32-bit load and TWO two-at-a-time conversions (the fast path converts a pair per instruction),
+    // not four scalar ones: item 3 of the fp8 card
+    uint32_t v4;
+    if (((uintptr_t) vr & 3) == 0) {
+        v4 = __ldg((const uint32_t*) (vr + o));
+    } else {
+        v4 = (uint32_t) vr[o] | ((uint32_t) vr[o + 1] << 8) | ((uint32_t) vr[o + 2] << 16) |
+             ((uint32_t) vr[o + 3] << 24);
+    }
+    const float2 f0 = e4m3fnx2_to_f2((uint16_t) (v4 & 0xFFFFu));
+    const float2 f1 = e4m3fnx2_to_f2((uint16_t) (v4 >> 16));
+    return make_float4(f0.x, f0.y, f1.x, f1.y);
+#else
     if (((uintptr_t) vr & 3) == 0) {
         const uint32_t v4 = __ldg((const uint32_t*) (vr + o));
         const float2 f0 = e4m3fnx2_to_f2((uint16_t) (v4 & 0xFFFFu));
@@ -4081,6 +4186,32 @@ __device__ __forceinline__ float4 v_load4<uint8_t>(const uint8_t* vr, int lane) 
     }
     return make_float4(e4m3fn_to_f32(vr[o]), e4m3fn_to_f32(vr[o + 1]), e4m3fn_to_f32(vr[o + 2]),
                        e4m3fn_to_f32(vr[o + 3]));
+#endif
+}
+
+// IK2_FP8_FAST's parity test (tests/ik2_kernels_test.cu): all 256 E4M3FN bytes through every route -- the path
+// that shipped before this change (scalar), the path the build selected, the LUT, two-at-a-time, and the float4
+// read helper -- so a build of either flag compares them byte for byte on the device.
+__global__ void fp8_cvt_selftest_kernel(const uint8_t* bytes, uint16_t* scalar, uint16_t* selected, uint16_t* lut,
+                                        uint16_t* x2, float* load4) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= 256) return;
+    scalar[i] = e4m3fn_to_f16_bits(bytes[i]);
+    selected[i] = e4m3fn_to_f16(bytes[i]);
+    lut[i] = kFp8ToF16Lut.v[bytes[i]];
+    if ((i & 1) == 0) {   // two elements at a time: bytes i and i + 1 from one packed pair
+        const uint16_t p2 = (uint16_t) (bytes[i] | ((uint16_t) bytes[i + 1] << 8));
+        const uint32_t h2 = e4m3fnx2_to_h2_u32(p2);
+        x2[i] = (uint16_t) (h2 & 0xFFFFu);
+        x2[i + 1] = (uint16_t) (h2 >> 16);
+    }
+    if (i < 64) {   // the float4 read helper: bytes 4i .. 4i+3 in lane i
+        const float4 f = v_load4<uint8_t>(bytes, i);
+        load4[4 * i] = f.x;
+        load4[4 * i + 1] = f.y;
+        load4[4 * i + 2] = f.z;
+        load4[4 * i + 3] = f.w;
+    }
 }
 
 template <class KV>
@@ -6654,6 +6785,12 @@ void attn_decode_mma_fp8(const uint16_t* q16, const float* r, const float* sink,
                          float* out, const float* gate, uint16_t* out16, cudaStream_t s) {
     attn_decode_mma_impl(q16, r, sink, kc, vc, kv_cap, H, Hkv, pos, qpos, n_split, qk_scale, v_inv_scale, proj, d_rel,
                          extent, window, scratch, out, gate, out16, s);
+}
+
+void fp8_cvt_selftest(const uint8_t* bytes, uint16_t* scalar, uint16_t* selected, uint16_t* lut, uint16_t* x2,
+                      float* load4, cudaStream_t s) {
+    fp8_cvt_selftest_kernel<<<1, 256, 0, s>>>(bytes, scalar, selected, lut, x2, load4);
+    check("fp8_cvt_selftest");
 }
 
 void unpack_kv_fp8_to_f16(const uint8_t* kc, const uint8_t* vc, int kv_cap, int k0, int nk, int KD,

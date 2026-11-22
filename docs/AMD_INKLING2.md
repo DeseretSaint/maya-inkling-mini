@@ -48,6 +48,28 @@ Four things, in the order they fail:
    - the gfx12 matrix-core layout differs from `mma.sync`'s, so the fragments are loaded for wave32
      (see below) rather than staged through `ldmatrix`.
 
+## The fp8 KV conversion (`IK2_FP8_FAST`)
+
+Every long-context run keeps its KV cache in FP8 E4M3FN (`IK2_KV=fp8`). Converting a cached byte to
+half was written for CUDA and gated on `__CUDA_ARCH__ >= 890`, an NVIDIA-only macro: HIP never defines
+it, so on gfx1201 every byte took the software bit-twiddle (shift, mask, exponent rebuild) and the
+`float4` read helper did four of those per load.
+
+gfx1201 does have the OCP fp8 conversion instructions. Measured from clang's target features for
+`--offload-arch=gfx1201`: `+fp8-conversion-insts,+ocp-fp8-conversion-insts`, and
+`v_cvt_pk_f32_fp8_e32` / `v_cvt_f32_fp8` come out of `__builtin_amdgcn_cvt_pk_f32_fp8` /
+`__builtin_amdgcn_cvt_f32_fp8`. There is **no** fp8 -> f16 instruction on gfx1201: `v_cvt_pk_f16_fp8`
+needs `gfx1250-insts`, so the two-at-a-time path converts the packed pair to two f32 with one
+instruction and packs it back to a half2 with `v_cvt_pk_f16_f32`.
+
+`-DIK2_FP8_FAST=ON` (CMake; **OFF** by default, and off it is the code that was there before) selects,
+per element pair: `v_cvt_pk_f32_fp8` where the target has it; otherwise a 256-entry LUT generated at
+compile time *from* the scalar function (one lookup per byte); otherwise the scalar path. The two
+E4M3FN NaNs (`0x7F`, `0xFF`) keep the scalar path's `0x7FFF` payload, so every route is bit-identical
+to the scalar one. `ik2_kernels_test` checks all 256 byte values through every route
+(`fp8 fast cvt: ...`), and the build's device ISA contains 15 `v_cvt_pk_f32_fp8` with the flag and none
+without it. No end-to-end speed claim here: that is K3b's measurement on the card.
+
 ## The matrix-core path
 
 `IK2_EXPERT_WMMA=1` (default) sends the expert GEMMs to `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12`

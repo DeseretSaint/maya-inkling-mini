@@ -271,6 +271,11 @@ void attn_decode_fp8(const float* q, const float* r, const float* sink, const ui
 void unpack_kv_fp8_to_f16(const uint8_t* kc, const uint8_t* vc, int kv_cap, int k0, int nk, int KD,
                           float k_inv_scale, float v_inv_scale, uint16_t* k_out16, uint16_t* v_out16,
                           cudaStream_t s);
+/// IK2_FP8_FAST's parity test: all 256 E4M3FN byte values (`bytes` = 0..255 in order) through every conversion
+/// route -- scalar (the path before the fast path), the path the build selected, the 256-entry LUT, two at a
+/// time, and the float4 read helper (load4 [64][4], the f32 values of bytes 4i .. 4i+3 in lane i).
+void fp8_cvt_selftest(const uint8_t* bytes, uint16_t* scalar, uint16_t* selected, uint16_t* lut, uint16_t* x2,
+                      float* load4, cudaStream_t s);
 
 // ---- the resident token path: every expert in VRAM (found on the device), the position read on the device, so a
 // token needs nothing from the host between its embedding and its logits and its launches replay as one CUDA graph
