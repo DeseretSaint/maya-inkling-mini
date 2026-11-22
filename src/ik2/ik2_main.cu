@@ -24,6 +24,7 @@
 #include "ik2_cpu.hpp"
 #include "ik2_cpu_deep.hpp"
 #include "ik2_draft.hpp"
+#include "ik2_alspec.hpp"
 #include "ik2_kernels.cuh"
 #include "strata/artifact/gguf_reader.hpp"
 
@@ -370,6 +371,11 @@ inline bool dual() { return g_ep || g_tp; }
 std::vector<uint8_t> g_ep_own;
 inline int ep_owner(int l, int e) { return g_ep_own[(size_t) l * g_pop_E_ep + e]; }
 bool g_flash = true;   // IK2_FLASH=0: the prefill's attention (FP16 KV) through the logits in memory and cuBLAS, not fused
+// IK2_ALSPEC: ALSpec-style gated attention, DARK.  The policy (src/ik2/ik2_alspec.hpp) decides which KV
+// blocks a global visit may drop, from a per-block gate mass; but the gate is a probe kernel this build
+// does not have, so even with IK2_ALSPEC=1 the exact path is taken and one line says so.  Off by default,
+// and nothing below is reached unless it is set.
+strata::ik2::alspec::Policy g_alspec;
 int g_n_sm = 0;
 bool g_group = true;   // IK2_GROUP=0: 2 .. 8 tokens' experts a slot at a time, their attention a head at a time
 bool g_group_exp = true, g_group_attn = true;   // (IK2_GROUP=1: the experts grouped only, 2: the attention only)
@@ -1730,6 +1736,9 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     const int window = Ly.sliding ? c.window : (1 << 30);
     const int k0 = Ly.sliding ? std::max(0, pos0 - c.window + 1) : 0;
     const int nk = pos0 + T - k0;
+    // (P5-4b: this is where a global visit's gate lands - alspec::plan over the probe kernel's per-block mass
+    //  turns into the drop mask the launches below read.  Nothing in this build produces that mass, so the
+    //  exact span is always read; see g_alspec and src/ik2/ik2_alspec.hpp.)
     const float one = 1.0f, zero = 0.0f;
     const float qk_scale = 1.0f / std::sqrt((float) c.D);
     const int attn_kv_cap = Ly.sliding ? Ly.kv_cap : 0;
@@ -4447,6 +4456,12 @@ int main(int argc, char** argv) {
     g_prof2 = getenv("IK2_PROF") && std::atoi(getenv("IK2_PROF")) == 2;
     g_tier_graph = getenv("IK2_GRAPH") && !g_fast_want ? std::atoi(getenv("IK2_GRAPH")) : 0;
     g_flash = !(getenv("IK2_FLASH") && !std::atoi(getenv("IK2_FLASH")));
+    g_alspec = strata::ik2::alspec::Policy::from_env();
+    if (g_alspec.enabled)
+        std::fprintf(stderr,
+                     "IK2_ALSPEC: policy armed - tau %g, tau_total %g, block %d keys, verify 1/%d; this build has no "
+                     "gate-score probe, so the exact path is taken (P5-4b)\n",
+                     (double) g_alspec.tau, (double) g_alspec.tau_total, g_alspec.block, g_alspec.verify_stride);
     g_mv = !getenv("IK2_MV") || std::atoi(getenv("IK2_MV"));
     g_group = !getenv("IK2_GROUP") || std::atoi(getenv("IK2_GROUP"));
     if (getenv("IK2_GROUP")) {
