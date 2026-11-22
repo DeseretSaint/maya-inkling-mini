@@ -373,18 +373,60 @@ int g_n_sm = 0;
 bool g_group = true;   // IK2_GROUP=0: 2 .. 8 tokens' experts a slot at a time, their attention a head at a time
 bool g_group_exp = true, g_group_attn = true;   // (IK2_GROUP=1: the experts grouped only, 2: the attention only)
 FILE* g_trace = nullptr;   // IK2_TRACE=FILE: each layer's picks, records of int32 (layer, T, K, T x K experts)
+// IK2_PROF=2: the phases' wall times from stream events (no host sync in the loop: a host gap lands in the phase that
+// follows it).  IK2_PROF=1 waits for the stream at each phase (slower, but GPU-bound only).
+bool g_prof2 = false;
+int g_tier_graph = 0;    // IK2_GRAPH=1: a visit's attention block replayed as a graph; 2: its replay-safe
+                         // primitives, launches one by one (0, the default: neither)
+double g_gap_host = 0;   // (IK2_PROF=2) seconds the host spent resolving expert slots with the stream empty
+int g_gap_visits = 0;
 struct Prof {
     double attn = 0, route = 0, upload = 0, experts = 0, rest = 0;
     double t = 0;
+    std::vector<cudaEvent_t> ev;   // (g_prof2: an interval boundary each)
+    std::vector<int> ev_ph;
+    static cudaEvent_t event() {
+        cudaEvent_t e;
+        cudaEventCreateWithFlags(&e, hipEventDefault);
+        return e;
+    }
     void start() {
         if (g_prof) cudaStreamSynchronize(g_s), t = now();
+        if (g_prof2 && ev.size() < 200000) ev.push_back(event()), ev_ph.push_back(-1), cudaEventRecord(ev.back(), g_s);
     }
     void lap(double& acc) {
+        if (g_prof2) {
+            if (ev.size() < 200000) {
+                ev.push_back(event());
+                ev_ph.push_back((int) (&acc - &attn));
+                cudaEventRecord(ev.back(), g_s);
+            }
+            return;
+        }
         if (!g_prof) return;
         cudaStreamSynchronize(g_s);
         const double n = now();
         acc += n - t;
         t = n;
+    }
+    void reset() {
+        for (auto e : ev) cudaEventDestroy(e);
+        ev.clear();
+        ev_ph.clear();
+    }
+    void dump() {
+        if (!g_prof2) return;
+        if (ev.size() < 2) return;
+        double sum[8] = {};
+        for (size_t i = 1; i < ev.size(); ++i) {
+            float ms = 0;
+            cudaEventElapsedTime(&ms, ev[i - 1], ev[i]);
+            const int p = ev_ph[i];
+            if (p >= 0 && p < 8) sum[p] += ms / 1e3;
+        }
+        std::fprintf(stderr, "profile2 (event intervals): attention %.3f s, router %.3f s, uploads %.3f s, experts %.3f s, "
+                             "rest %.3f s, %zu intervals; host expert resolution %.3f s over %d visits\n",
+                     sum[0], sum[1], sum[2], sum[3], sum[4], ev.size(), g_gap_host, g_gap_visits);
     }
 } g_pf;
 
@@ -1660,6 +1702,10 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
         k::prep_qkv_r_fp8(q_p, Ly.q_clip, W.kconv, Ly.kc8, W.vconv, Ly.vc8, r_p, Ly.r_clip, T, c.H, c.KV, c.D, c.d_rel,
                           c.qk_clip, c.rel_clip, c.eps, Ly.sliding ? nullptr : pos_p, c.alpha, c.n_floor, pos0,
                           Ly.kv_cap, k_scale, v_scale, g_s);
+    } else if (g_tier_graph && T == 1) {   // (the position read on the device: a captured visit replays at every one)
+        k::prep_qkv_r_f16_at(q_p, Ly.q_clip, W.kconv, Ly.kc, W.vconv, Ly.vc, r_p, Ly.r_clip, c.H, c.KV, c.D, c.d_rel,
+                             c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha, c.n_floor, Ly.kv_cap, nullptr,
+                             g_s, nullptr, nullptr, 0, nullptr);
     } else {
         k::prep_qkv_r_f16(q_p, Ly.q_clip, W.kconv, Ly.kc, W.vconv, Ly.vc, r_p, Ly.r_clip, T, c.H, c.KV, c.D, c.d_rel,
                           c.qk_clip, c.rel_clip, c.eps, Ly.sliding ? nullptr : pos_p, c.alpha, c.n_floor, pos0,
@@ -1677,6 +1723,10 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
         if (g_kv_fp8) {
             k::attn_decode_fp8(q_p, r_p, sink_p, Ly.kc8, Ly.vc8, attn_kv_cap, c.H, c.KV, c.D, k0, nk, pos0,
                                qk_scale * k_inv, v_inv, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
+        } else if (g_tier_graph) {   // (the same split count the host would pick, the position from W.pos)
+            const int P = std::min(128, std::max(1, (nk + 63) / 64));
+            k::attn_decode_f16_at(q_p, r_p, sink_p, Ly.kc, Ly.vc, attn_kv_cap, c.H, c.KV, W.pos, P, qk_scale,
+                                  Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
         } else {
             k::attn_decode_f16(q_p, r_p, sink_p, Ly.kc, Ly.vc, attn_kv_cap, c.H, c.KV, c.D, k0, nk, pos0, qk_scale,
                                Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
@@ -1814,6 +1864,64 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
         k::conv4(W.tmp, Ly.h_attn, Ly.sc_attn, nullptr, 0, T, C, r_out, g_s);
     } else {
         k::conv4_res(W.tmp, Ly.h_attn, Ly.sc_attn, nullptr, 0, T, C, h_in, r_out, g_s);
+    }
+}
+
+// ---- IK2_GRAPH=1: a tiered decode token's attention block, one graph a layer visit (no host value in its launches:
+// the position is read on the device, the split count is fixed while it holds, the weights of a visit never move).
+// This is the unit that can be replayed: the routing round trip after it cannot (IK2_GRAPH=1 reports that on the first
+// token), and the expert block's pointer table is the host's to build, a token at a time.
+struct VisitGraph {
+    cudaGraph_t graph = nullptr;
+    cudaGraphExec_t exec = nullptr;
+    int key = -1;
+};
+std::vector<VisitGraph> g_vgraphs;
+bool g_vgraph_off = false;
+long long g_vgraph_builds = 0;   // (recaptures: the split count follows the position until the window is full)
+
+void run_layer_attn_step(const Model& M, Layer& Ly, int l, int vis, int T, int pos0, const float* h_in,
+                         const int* pos_p, int nb, float* r_out, Work& W, const float* msg) {
+    if (g_tier_graph != 1 || T != 1 || g_vgraph_off || g_kv_fp8) {
+        run_layer_attn(M, Ly, l, T, pos0, h_in, pos_p, nb, 0, r_out, W, msg);
+        return;
+    }
+    const int k0 = Ly.sliding ? std::max(0, pos0 - M.c.window + 1) : 0;
+    const int nk = pos0 + 1 - k0;
+    const int key = std::min(128, std::max(1, (nk + 63) / 64));
+    if ((int) g_vgraphs.size() <= vis) g_vgraphs.resize(vis + 1);
+    VisitGraph& G = g_vgraphs[vis];
+    if (!G.exec || G.key != key) {
+        if (G.exec) cudaGraphExecDestroy(G.exec), G.exec = nullptr;
+        if (G.graph) cudaGraphDestroy(G.graph), G.graph = nullptr;
+        const bool began = cudaStreamBeginCapture(g_s, cudaStreamCaptureModeGlobal) == cudaSuccess;
+        if (!began) {
+            std::fprintf(stderr, "IK2_GRAPH=1: visit %d: stream capture refused; the path's launches run one by one\n", vis);
+            g_vgraph_off = true;
+            run_layer_attn(M, Ly, l, T, pos0, h_in, pos_p, nb, 0, r_out, W, msg);
+            return;
+        }
+        run_layer_attn(M, Ly, l, T, pos0, h_in, pos_p, nb, 0, r_out, W, msg);
+        if (cudaStreamEndCapture(g_s, &G.graph) != cudaSuccess || !G.graph ||
+            cudaGraphInstantiate(&G.exec, G.graph, 0) != cudaSuccess || !G.exec) {
+            std::fprintf(stderr, "IK2_GRAPH=1: visit %d: capture / instantiate failed (%s); launches one by one\n", vis,
+                         cudaGetErrorString(cudaGetLastError()));
+            cudaGetLastError();
+            if (G.graph) cudaGraphDestroy(G.graph), G.graph = nullptr;
+            G.exec = nullptr;
+            g_vgraph_off = true;
+            run_layer_attn(M, Ly, l, T, pos0, h_in, pos_p, nb, 0, r_out, W, msg);
+            return;
+        }
+        G.key = key;
+        ++g_vgraph_builds;
+    }
+    if (cudaGraphLaunch(G.exec, g_s) != cudaSuccess) {
+        std::fprintf(stderr, "IK2_GRAPH=1: visit %d: graph launch failed (%s); launches one by one\n", vis,
+                     cudaGetErrorString(cudaGetLastError()));
+        cudaGetLastError();
+        g_vgraph_off = true;
+        run_layer_attn(M, Ly, l, T, pos0, h_in, pos_p, nb, 0, r_out, W, msg);
     }
 }
 
@@ -2201,6 +2309,100 @@ void run_head(const Model& M, int T, bool all_logits, OutMode out_mode, int nb, 
         }
     }
     g_pf.lap(g_pf.rest);
+}
+
+// ---- can the tiered decode path's launch stream be replayed as a graph?  (IK2_GRAPH=1)
+// The resident path above is one graph a token because nothing in it reads a device value on the host.  This path is
+// the other way round: per layer visit it copies the routing result to the host, waits for the stream there, picks the
+// expert slots and builds the pointer table.  This probe walks one visit's launches under a capture and reports, once,
+// exactly what the capture hits - so the answer to "can it be replayed?" is measured, not guessed.
+bool g_tier_probed = false;
+
+static void tier_graph_report(const char* what, cudaError_t e) {
+    std::fprintf(stderr, "IK2_GRAPH=1: %s -> %s (%d)\n", what, e ? cudaGetErrorString(e) : "ok", (int) e);
+}
+
+void tier_graph_probe_visit(Model& M, Work& W, int pos0, int vis);
+
+void tier_graph_probe(Model& M, Work& W, int pos0) {
+    tier_graph_probe_visit(M, W, pos0, 0);
+    tier_graph_probe_visit(M, W, pos0, 5);
+    // (2) the same visit plus its routing round trip: the D2H the host picks the expert slots from, and the wait
+    {
+        cudaError_t e = cudaStreamBeginCapture(g_s, cudaStreamCaptureModeGlobal);
+        tier_graph_report("begin capture (visit + routing round trip)", e);
+        if (!e) {
+            run_layer_attn(M, M.L[M.V[0].l], M.V[0].l, 1, pos0, W.h, W.pos, 0, 0, W.r, W, nullptr);
+            cudaMemcpyAsync(W.route_h, W.route_d, (size_t) M.c.K * 8, cudaMemcpyDeviceToHost, g_s);
+            e = cudaStreamSynchronize(g_s);
+            tier_graph_report("cudaStreamSynchronize inside the capture (the routing round trip)", e);
+            cudaGraph_t g = nullptr;
+            const cudaError_t ee = cudaStreamEndCapture(g_s, &g);
+            tier_graph_report("end capture (after the wait)", ee);
+            if (g) cudaGraphDestroy(g);
+            cudaGetLastError();
+        }
+    }
+    std::fprintf(stderr, "IK2_GRAPH=1: the tiered token path is not replayable as one graph; its launches run one by one\n");
+}
+
+void tier_graph_probe_visit(Model& M, Work& W, int pos0, int vis) {
+    // one layer visit's attention block, which reads no device value on the host
+    {
+        cudaError_t e = cudaStreamBeginCapture(g_s, cudaStreamCaptureModeGlobal);
+        tier_graph_report("begin capture (attention block)", e);
+        if (e) return;
+        Layer& Lv = M.L[M.V[vis].l];
+        run_layer_attn(M, Lv, M.V[vis].l, 1, pos0, W.h, W.pos, 0, 0, W.r, W, nullptr);
+        cudaGraph_t g = nullptr;
+        e = cudaStreamEndCapture(g_s, &g);
+        tier_graph_report("end capture (attention block)", e);
+        if (!e && g) {
+            cudaGraphExec_t ex = nullptr;
+            const cudaError_t ei = cudaGraphInstantiate(&ex, g, 0);
+            tier_graph_report("instantiate (attention block)", ei);
+            size_t nodes = 0;
+            if (!cudaGraphGetNodes(g, nullptr, &nodes))
+                std::fprintf(stderr, "IK2_GRAPH=1: attention block graph: %zu nodes\n", nodes);
+            if (ex) {
+                // The closest alternative there is: that block replayed as a graph against the same block launched
+                // one call at a time (both leave the same values: a visit at one position is idempotent).
+                const int R = 24;
+                Layer& Ly = Lv;
+                const int lv = M.V[vis].l;
+                cudaEvent_t e0, e1;
+                cudaEventCreate(&e0), cudaEventCreate(&e1);
+                cudaStreamSynchronize(g_s);
+                double t0 = now();
+                cudaEventRecord(e0, g_s);
+                for (int r = 0; r < R; ++r)
+                    run_layer_attn(M, Ly, lv, 1, pos0, W.h, W.pos, 0, 0, W.r, W, nullptr);
+                cudaEventRecord(e1, g_s);
+                cudaStreamSynchronize(g_s);
+                const double t_dir = now() - t0;
+                float gpu_dir = 0;
+                cudaEventElapsedTime(&gpu_dir, e0, e1);
+                t0 = now();
+                cudaEventRecord(e0, g_s);
+                for (int r = 0; r < R; ++r) cudaGraphLaunch(ex, g_s);
+                cudaEventRecord(e1, g_s);
+                cudaStreamSynchronize(g_s);
+                const double t_gr = now() - t0;
+                float gpu_gr = 0;
+                cudaEventElapsedTime(&gpu_gr, e0, e1);
+                std::fprintf(stderr, "IK2_GRAPH=1: visit %d's attention block, %d runs: launched %.1f us a run (gpu %.1f), "
+                                     "replayed %.1f us a run (gpu %.1f)\n", vis, R, t_dir * 1e6 / R, gpu_dir * 1e3 / R,
+                             t_gr * 1e6 / R, gpu_gr * 1e3 / R);
+                cudaEventDestroy(e0), cudaEventDestroy(e1);
+                cudaGraphExecDestroy(ex);
+            }
+            cudaGraphDestroy(g);
+        } else if (g) {
+            cudaGraphDestroy(g);
+        }
+        cudaGetLastError();
+    }
+
 }
 
 // ---- the resident token path
@@ -3092,6 +3294,11 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
     }
     if (out_mode == OutMode::kCand) out_mode = OutMode::kLogits, g_cand.n = -1;   // (this path: the logits)
     use_dev(M.L[0].dev);
+    static const bool probe_capture = getenv("IK2_GRAPH_PROBE") && std::atoi(getenv("IK2_GRAPH_PROBE"));
+    if (g_tier_graph == 1 && probe_capture && T == 1 && !g_tier_probed) {   // (once: what a graph of this path hits)
+        g_tier_probed = true;
+        tier_graph_probe(M, dev_work(g_cur), pos0);
+    }
     Work* Wp = &dev_work(g_cur);
     ExpertCache* ECp = &dev_cache(g_cur);
 #define W (*Wp)
@@ -3172,7 +3379,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
             if (tap >= 0)
                 CU(cudaMemcpyAsync(g_taps + (size_t) tap * g_taps_ld * C, W.h, TC * 4, cudaMemcpyDeviceToDevice, g_s));
         }
-        run_layer_attn(M, Ly, l, T, pos0, W.h, W.pos, nb, 0, W.r, W, msg);
+        run_layer_attn_step(M, Ly, l, vis, T, pos0, W.h, W.pos, nb, W.r, W, msg);
         dump_f("blk." + std::to_string(vis) + ".attn_out", W.r, TC);
         if (l % c.block == 0) ++nb;
         // the MoE
@@ -3622,6 +3829,7 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                 }
             }
             g_pf.lap(g_pf.upload);
+            if (g_prof2) g_gap_host += now() - te0, ++g_gap_visits;
             // one copy of the tables from pinned memory: [64] pointers, then tok, inv, sg, su, wt [64] each
             std::memcpy(pk, blob, S * sizeof(void*));
             std::memcpy(pk + 512, tk, S * 4);
@@ -4220,7 +4428,9 @@ int main(int argc, char** argv) {
         else if (a == "--dump") dump = next();
         else die("unknown argument " + a);
     }
-    g_prof = getenv("IK2_PROF") && std::atoi(getenv("IK2_PROF"));
+    g_prof = getenv("IK2_PROF") && std::atoi(getenv("IK2_PROF")) == 1;
+    g_prof2 = getenv("IK2_PROF") && std::atoi(getenv("IK2_PROF")) == 2;
+    g_tier_graph = getenv("IK2_GRAPH") && !g_fast_want ? std::atoi(getenv("IK2_GRAPH")) : 0;
     g_flash = !(getenv("IK2_FLASH") && !std::atoi(getenv("IK2_FLASH")));
     g_mv = !getenv("IK2_MV") || std::atoi(getenv("IK2_MV"));
     g_group = !getenv("IK2_GROUP") || std::atoi(getenv("IK2_GROUP"));
@@ -5213,6 +5423,7 @@ int main(int argc, char** argv) {
             }
             EC.misses = m0, EC.bytes_up = b0;
             g_fast = true;
+            g_tier_graph = 0;   // (the resident path has its own graph; the tiered one's flags do not apply to it)
             std::printf("resident: every expert in VRAM (%d copied in %.1f s); tokens take the resident path%s\n", n,
                         now() - tw, g_graph ? ", a CUDA graph each" : "");
         } else {
@@ -5830,6 +6041,7 @@ int main(int argc, char** argv) {
     // greedy generation
     g_pf = Prof{};
     std::vector<int> out;
+    if (g_prof2) g_pf.reset();
     const double tg = now();
     const uint64_t h0 = (uint64_t) ec_sum([](ExpertCache& e) { return e.hits; }),
                    m0 = (uint64_t) ec_sum([](ExpertCache& e) { return e.misses; });
@@ -6062,6 +6274,7 @@ int main(int argc, char** argv) {
         }
         for (size_t j = 0; j < out.size(); ++j) std::printf("%d%s", out[j], j + 1 < out.size() ? "," : "\n");
     }
+    g_pf.dump();
     const double gen_s = now() - tg;
     if (drafter && (ctl.steps || ctl.plain)) {
         std::printf("speculative: %llu windows (%llu drafts, %llu accepted: %.2f tokens a window; accepted drafts:",
@@ -6085,6 +6298,9 @@ int main(int argc, char** argv) {
     if (g_pool && g_cpu_batches)
         std::printf("CPU lane batches: %ld, %.1f us each, Q8_0 %.2f ms a job\n", g_cpu_batches,
                     g_cpu_busy / g_cpu_batches * 1e6, g_t_cpu_f[1] * 1e3);
+    if (g_tier_graph)
+        std::fprintf(stderr, "IK2_GRAPH=1: %lld visit graphs captured, %s\n", g_vgraph_builds,
+                     g_vgraph_off ? "replay off (a capture failed)" : "replay in use");
     if (g_prof)
         std::printf("profile (all calls): attention %.2f s, router %.2f s, uploads %.2f s, experts %.2f s, rest %.2f s\n",
                     g_pf.attn, g_pf.route, g_pf.upload, g_pf.experts, g_pf.rest);
