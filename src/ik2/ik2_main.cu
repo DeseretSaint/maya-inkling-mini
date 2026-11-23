@@ -3908,7 +3908,12 @@ void forward(Model& M, const int* tok, int T, int pos0, bool all_logits, OutMode
                                         W.y32 + (size_t) p0 * C, g_s);
                     continue;
                 }
-                if (g_group && g_group_exp && T > 1) {
+                // IK2_GROUP_DECODE=1: admit the grouped kernels at T == 1 too (K4's A/B). At T == 1 every group
+                // holds one token, so this is the same bytes with the grouped kernel's own tiling - a null
+                // result is the expected one, and the measurement is what the card asks for.
+                static const bool g_group_decode =
+                    getenv("IK2_GROUP_DECODE") && atoi(getenv("IK2_GROUP_DECODE")) != 0;
+                if (g_group && g_group_exp && (T > 1 || g_group_decode)) {
                     const int g0 = part ? ng[0] : 0, gc = ng[part];
                     k::experts_gate_up_swiglu_g(pgb + g0, pgn + g0, pgt + (size_t) g0 * k::kGroupMax,
                                                 pgr + (size_t) g0 * k::kGroupMax, gc, Ly.ty[0], Ly.ty[1], Ly.eb[0],
