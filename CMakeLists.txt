@@ -899,18 +899,20 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
       message(STATUS "Maya: maya-ik2 not built - it needs sm_80 or newer, arch ${_strata_archs}")
     endif()
   endif()
-  # K3a: the fp8 E4M3FN -> half fast path in src/ik2/ik2_kernels.cu (HIP: gfx12's fp8 conversion instructions,
-  # a 256-entry LUT elsewhere). Default OFF: the shipping conversion is the software path until K3b validates the
-  # fast one on the card, and the flag is the only thing that changes it.
-  option(IK2_FP8_FAST "maya-ik2: use the fp8 -> half fast conversion path (HIP: native cvt_pk_f32_fp8 or LUT)" OFF)
+  # K3a/K3c: the fp8 E4M3FN -> half fast path in src/ik2/ik2_kernels.cu (HIP: gfx12's fp8 conversion instructions,
+  # a 256-entry LUT on a HIP target that has none). Default ON since K3c: K3b measured it bit-exact (greedy ids
+  # md5-identical OFF vs ON at 16256 / 131072 / 261000 tokens, 3 reps each; 350/350 kernel cases on both builds)
+  # and +3.8 / +12.4 / +18.4% decode at those depths with prefill unchanged, so the flag is the shipping path.
+  # It is applied to the HIP library only: a CUDA build already selects its own native conversion by
+  # __CUDA_ARCH__ >= 890, and forcing this flag there would replace it with the LUT lookup.
+  option(IK2_FP8_FAST "maya-ik2: use the fp8 -> half fast conversion path (HIP: native cvt_pk_f32_fp8 or LUT)" ON)
   if(STRATA_ENABLE_CUDA AND (_ik2_archs OR NOT _ik2_filter))
     find_package(Threads REQUIRED)
     add_library(ik2_kernels STATIC src/ik2/ik2_kernels.cu)
     target_include_directories(ik2_kernels PUBLIC ${_strata_gpu_include_directories} src/ik2)
     target_link_libraries(ik2_kernels PUBLIC ${_strata_gpu_runtime_target})
-    if(IK2_FP8_FAST)
-      target_compile_definitions(ik2_kernels PUBLIC IK2_FP8_FAST=1)
-    endif()
+    # (IK2_FP8_FAST is a HIP-path flag: a CUDA build keeps its own __CUDA_ARCH__ >= 890 conversion, which is
+    #  better than the LUT this flag would select there - see the option above)
     # the engine: the experts in pinned host memory, a cache of them in VRAM; one GPU, or two (IK2_EP=1 / IK2_TP=1)
     add_executable(maya-ik2 src/ik2/ik2_main.cu src/ik2/ik2_draft.cu src/ik2/ik2_cpu.cpp)
     if(MSVC)

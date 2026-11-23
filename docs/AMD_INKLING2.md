@@ -62,13 +62,16 @@ gfx1201 does have the OCP fp8 conversion instructions. Measured from clang's tar
 needs `gfx1250-insts`, so the two-at-a-time path converts the packed pair to two f32 with one
 instruction and packs it back to a half2 with `v_cvt_pk_f16_f32`.
 
-`-DIK2_FP8_FAST=ON` (CMake; **OFF** by default, and off it is the code that was there before) selects,
-per element pair: `v_cvt_pk_f32_fp8` where the target has it; otherwise a 256-entry LUT generated at
-compile time *from* the scalar function (one lookup per byte); otherwise the scalar path. The two
-E4M3FN NaNs (`0x7F`, `0xFF`) keep the scalar path's `0x7FFF` payload, so every route is bit-identical
-to the scalar one. `ik2_kernels_test` checks all 256 byte values through every route
+`IK2_FP8_FAST` (CMake; **ON** by default since K3c, and `-DIK2_FP8_FAST=OFF` restores the code that was
+there before) selects, per element pair: `v_cvt_pk_f32_fp8` where the target has it; otherwise a
+256-entry LUT generated at compile time *from* the scalar function (one lookup per byte); otherwise the
+scalar path. The two E4M3FN NaNs (`0x7F`, `0xFF`) keep the scalar path's `0x7FFF` payload, so every route
+is bit-identical to the scalar one. `ik2_kernels_test` checks all 256 byte values through every route
 (`fp8 fast cvt: ...`), and the build's device ISA contains 15 `v_cvt_pk_f32_fp8` with the flag and none
-without it. No end-to-end speed claim here: that is K3b's measurement on the card.
+without it. The default is ON because K3b measured it on the card: greedy id streams md5-identical OFF vs
+ON at 16256 / 131072 / 261000 tokens (3 reps each), 350/350 kernel cases on both builds, and decode
++3.8 / +12.4 / +18.4% at those depths with prefill unchanged. The flag is applied to the HIP kernels only;
+a CUDA build keeps its own `__CUDA_ARCH__ >= 890` conversion, which beats the LUT this flag would pick there.
 
 ## The matrix-core path
 
