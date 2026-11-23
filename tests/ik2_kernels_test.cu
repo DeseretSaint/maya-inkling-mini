@@ -2165,6 +2165,49 @@ void test_fp8_kv() {
     }
 }
 
+void test_fp8_fast_cvt() {
+    // 3. K3a/IK2_FP8_FAST: all 256 E4M3FN bytes through every conversion route, bit for bit against the scalar
+    //    path that shipped before the fast path. The reference is the scalar bit-twiddle, not the GPU's opinion:
+    //    selected (what this build's kernels call), the 256-entry LUT, two-at-a-time, and the float4 read helper.
+#ifndef IK2_FP8_FAST
+#define IK2_FP8_FAST 0
+#endif
+    std::printf("  IK2_FP8_FAST=%d\n", (int) IK2_FP8_FAST);
+    std::vector<uint8_t> all_b(256);
+    for (int i = 0; i < 256; ++i) all_b[i] = (uint8_t) i;
+    uint8_t* db = dev(all_b);
+    uint16_t* dsc = dev_n<uint16_t>(256);
+    uint16_t* dsel = dev_n<uint16_t>(256);
+    uint16_t* dlut = dev_n<uint16_t>(256);
+    uint16_t* dx2 = dev_n<uint16_t>(256);
+    float* dload = dev_n<float>(256);
+    k::fp8_cvt_selftest(db, dsc, dsel, dlut, dx2, dload, 0);
+    const auto sc = host(dsc, 256), sel = host(dsel, 256), lut = host(dlut, 256), x2 = host(dx2, 256);
+    const auto load = host(dload, 256);
+    bool sel_ok = true, lut_ok = true, x2_ok = true, load_ok = true;
+    for (int b = 0; b < 256; ++b) {
+        sel_ok &= sel[b] == sc[b];
+        lut_ok &= lut[b] == sc[b];
+        x2_ok &= x2[b] == sc[b];
+    }
+    for (int lane = 0; lane < 64; ++lane) {
+        for (int k = 0; k < 4; ++k) {
+            const int b = lane * 4 + k;
+            const uint16_t h = sc[b];
+            const bool nan = (h & 0x7C00) == 0x7C00 && (h & 0x03FF) != 0;
+            const float want = nan ? NAN : h2f_host(h);
+            load_ok &= nan ? std::isnan(load[b]) : (load[b] == want);
+        }
+    }
+    expect_true("fp8 fast cvt: selected path == scalar, all 256 bytes", sel_ok);
+    expect_true("fp8 fast cvt: LUT == scalar, all 256 bytes", lut_ok);
+    expect_true("fp8 fast cvt: two-at-a-time == scalar, all 256 bytes", x2_ok);
+    expect_true("fp8 fast cvt: float4 read helper == scalar, all 256 bytes", load_ok);
+    cudaFree(db);
+    for (uint16_t* p : {dsc, dsel, dlut, dx2}) cudaFree(p);
+    cudaFree(dload);
+}
+
 void test_round6() {
     // 1. attn_res_rms_f16: C=4608 (vectorized float4/576-thread) and odd C=517 (scalar fallback), with optional w / y32
     for (int C : {4608, 517}) {
@@ -2697,6 +2740,7 @@ int main() {
     test_attn_f16();
     test_round2_fused();
     test_fp8_kv();
+    test_fp8_fast_cvt();
     test_round6();
     test_attn_flash();   // (last: its random data leaves the others' as they were)
     test_attn_decode_mma();
