@@ -251,7 +251,8 @@ void attn_multi_f16(const float* q, const float* r, const float* sink, const uin
                     int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s);
 void attn_decode_f16(const float* q, const float* r, const float* sink, const uint16_t* kc, const uint16_t* vc,
                      int kv_cap, int H, int Hkv, int D, int k0, int nk, int qpos, float qk_scale, const float* proj,
-                     int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s);
+                     int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s,
+                     const uint8_t* block_skip = nullptr);
 
 /// FP8 (E4M3FN) K / V cache variants: scale K by k_scale and V by v_scale on write; fold 1/k_scale into qk_scale
 /// and pass v_inv_scale = 1/v_scale on read.  slot = kv_cap > 0 ? (pos0 + t) % kv_cap : (pos0 + t).  D = 128.
@@ -266,7 +267,7 @@ void attn_multi_fp8(const float* q, const float* r, const float* sink, const uin
 void attn_decode_fp8(const float* q, const float* r, const float* sink, const uint8_t* kc, const uint8_t* vc,
                      int kv_cap, int H, int Hkv, int D, int k0, int nk, int qpos, float qk_scale,
                      float v_inv_scale, const float* proj, int d_rel, int extent, int window, float* scratch,
-                     float* out, cudaStream_t s);
+                     float* out, cudaStream_t s, const uint8_t* block_skip = nullptr);
 /// Unwrap nk KV rows starting at k0 from FP8 ring buffer into contiguous FP16 [nk, KD] scaled by k_inv_scale / v_inv_scale.
 void unpack_kv_fp8_to_f16(const uint8_t* kc, const uint8_t* vc, int kv_cap, int k0, int nk, int KD,
                           float k_inv_scale, float v_inv_scale, uint16_t* k_out16, uint16_t* v_out16,
@@ -337,11 +338,12 @@ void prep_qkv_r_fp8_at(float* q, const float* q_clip, const float* k_in, uint8_t
 /// a token to the next).  scratch: H x P x 130 floats.
 void attn_decode_f16_at(const float* q, const float* r, const float* sink, const uint16_t* kc, const uint16_t* vc,
                         int kv_cap, int H, int Hkv, const int* pos, int P, float qk_scale, const float* proj,
-                        int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s);
+                        int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s,
+                        const uint8_t* block_skip = nullptr);
 void attn_decode_fp8_at(const float* q, const float* r, const float* sink, const uint8_t* kc, const uint8_t* vc,
                         int kv_cap, int H, int Hkv, const int* pos, int P, float qk_scale, float v_inv_scale,
                         const float* proj, int d_rel, int extent, int window, float* scratch, float* out,
-                        cudaStream_t s);
+                        cudaStream_t s, const uint8_t* block_skip = nullptr);
 
 /// One token's attention on the tensor cores - for long contexts, where the scalar attn_decode is bound by its
 /// arithmetic; this one reads at the memory's speed, an FP8 cache too.  q16 [H][128]: the clipped q in FP16;

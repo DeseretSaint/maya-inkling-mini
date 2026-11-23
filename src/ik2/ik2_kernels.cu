@@ -4114,7 +4114,7 @@ alspec_gate_kernel(const uint16_t* __restrict__ q16, const KVT* __restrict__ kc,
                    int qpos, float qk_scale, const float* __restrict__ r, const float* __restrict__ proj, int d_rel,
                    int extent, int stride, int verify_stride, uint64_t seed, int visit, int n_blocks,
                    float2* __restrict__ est, float2* __restrict__ exact) {
-    __shared__ float smq[kFaD * 24];   // (this model: 24 query heads; the host refuses the gate for more)
+    __shared__ __align__(16) float smq[kFaD * 24];   // (this model: 24 query heads; the host refuses the gate for more)
     __shared__ float sm_m[4], sm_s[4], sm_me[4], sm_se[4];
     if (pos_d) qpos = *pos_d;
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, R = H / Hkv, KD = Hkv * kFaD;
@@ -4126,10 +4126,16 @@ alspec_gate_kernel(const uint16_t* __restrict__ q16, const KVT* __restrict__ kc,
     if (!ver && threadIdx.x == 0) exact[b] = make_float2(NAN, NAN);
     const int j0 = b * 128, j1 = min(qpos + 1, j0 + 128);
     float m = -INFINITY, s = 0.0f, me = -INFINITY, se = 0.0f;
-    for (int j = j0 + warp; j < j1; j += 4) {
+    // A probe-only block reads one key in `stride`, and the four warps must SHARE that sample: stepping
+    // every 4th key put every sampled key (rel % stride == 0, stride a multiple of 4) in warp 0 and left
+    // three quarters of the block's threads idle, which made the probe cost about what the skip saved.
+    // (A block in the verification sample still reads every key, so it keeps the mod-4 walk.)
+    const int st0 = ver ? (j0 + warp) : (j0 + warp * stride);
+    const int stp = ver ? 4 : stride * 4;
+    for (int j = st0; j < j1; j += stp) {
         const int dist = qpos - j;
-        const bool samp = ((j - j0) % stride) == 0;
-        if (dist < 0 || (!samp && !ver)) continue;
+        const bool samp = ver ? (((j - j0) % stride) == 0) : true;
+        if (dist < 0) continue;
         const size_t koff = (size_t) j * KD;
         float mk = -INFINITY, sk = 0.0f;   // this key's 24 heads: online (max, sum of exp)
         for (int g = 0; g < Hkv; ++g) {
@@ -4139,8 +4145,11 @@ alspec_gate_kernel(const uint16_t* __restrict__ q16, const KVT* __restrict__ kc,
                 const float4 q4 = *(const float4*) (smq + h * kFaD + lane * 4);
                 const float a = q4.x * k4.x + q4.y * k4.y + q4.z * k4.z + q4.w * k4.w;
                 float l = wsum(a) * qk_scale;
-                if (dist < extent && lane < d_rel)
-                    l += wsum(__ldg(r + (size_t) h * d_rel + lane) * __ldg(proj + (size_t) dist * d_rel + lane));
+                // (the bias's lanes: every lane must reach wsum, so the condition is inside the operand)
+                const float b = (dist < extent && lane < d_rel)
+                                    ? __ldg(r + (size_t) h * d_rel + lane) * __ldg(proj + (size_t) dist * d_rel + lane)
+                                    : 0.0f;
+                l += wsum(b);
                 const float mn = fmaxf(mk, l);
                 sk = (mk == -INFINITY ? 0.0f : sk * __expf(mk - mn)) + __expf(l - mn);
                 mk = mn;
@@ -4262,6 +4271,13 @@ alspec_plan_kernel(const float2* __restrict__ est, const float2* __restrict__ ex
         vchk += 1;
         if (share_of(e) / tot >= tau) vfail += 1;
     }
+    vchk = (int) reduce_sum((float) vchk);
+    vfail = (int) reduce_sum((float) vfail);
+    if (vfail > 0) {   // (the policy: a failed sample is taken on the exact path, never reported as a win)
+        for (int b = tid; b < n_blocks; b += 128) mask[b] = 0;
+        nskip = 0;
+        dropped = 0.0f;
+    }
     if (tid == 0) {
         cnt[0] += nb;
         cnt[1] += nskip;
@@ -4276,7 +4292,8 @@ template <class KV>
 __device__ __forceinline__ void attn_flash_range(const float* qh, const float* rh, const KV* kc, const KV* vc,
                                                  int KD, int g, int kv_cap, int k0, int j0, int j1, int qpos,
                                                  float qk_scale, const float* proj, int d_rel, int extent, int window,
-                                                 float* sm_m, float* sm_s, float sm_o[][128]) {
+                                                 float* sm_m, float* sm_s, float sm_o[][128],
+                                                 const uint8_t* block_skip = nullptr) {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int o = lane * 4;
     const float4 q4 = (((uintptr_t) qh & 15) == 0) ? __ldg((const float4*) (qh + o))
@@ -4288,6 +4305,9 @@ __device__ __forceinline__ void attn_flash_range(const float* qh, const float* r
         const int pos = k0 + j;
         const int dist = qpos - pos;
         if (dist < 0 || dist >= window) continue;
+        // IK2_ALSPEC (P5-4b): a 128-key block the gate probe found under tau is not read at all (a global visit's
+        // keys are absolute, so the block is pos / 128; sliding visits never carry a mask).
+        if (block_skip && block_skip[(size_t) pos >> 7]) continue;
         const int slot = kv_cap > 0 ? pos % kv_cap : pos;
         const size_t head_off = (size_t) slot * KD + (size_t) g * 128;
         const float4 k4 = v_load4(kc + head_off, lane);
@@ -4322,7 +4342,8 @@ __device__ __forceinline__ void attn_flash_range(const float* qh, const float* r
 template <class KV>
 __global__ void attn_split_kernel(const float* q, const float* r, const KV* kc, const KV* vc, int kv_cap, int H,
                                   int Hkv, int k0, int nk, int qpos0, float qk_scale, const float* proj, int d_rel,
-                                  int extent, int window, float* part, const int* pos_d) {
+                                  int extent, int window, float* part, const int* pos_d,
+                                  const uint8_t* block_skip) {
     if (pos_d) {   // (tokens of a replayed graph: the first's position read here, the keys they may see from it)
         qpos0 = *pos_d;
         k0 = window < (1 << 30) ? max(0, qpos0 - window + 1) : 0;
@@ -4336,7 +4357,7 @@ __global__ void attn_split_kernel(const float* q, const float* r, const KV* kc, 
     const float* qh = q + ((size_t) qi * H + h) * 128;
     const float* rh = r + ((size_t) qi * H + h) * d_rel;
     attn_flash_range(qh, rh, kc, vc, KD, g, kv_cap, k0, j0, j1, qpos, qk_scale, proj, d_rel, extent, window, sm_m,
-                     sm_s, sm_o);
+                     sm_s, sm_o, block_skip);
     const float M = fmaxf(fmaxf(sm_m[0], sm_m[1]), fmaxf(sm_m[2], sm_m[3]));
     float sum = 0.0f, o = 0.0f;
     if (M > -INFINITY) {
@@ -6588,7 +6609,7 @@ void attn_multi_impl(const float* q, const float* r, const float* sink, const KV
     const int P = std::min(128, std::max(1, (nk + 63) / 64));
     float* part = scratch;
     attn_split_kernel<KV><<<dim3(H, P, nq), 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0, nk, qpos0, qk_scale, proj,
-                                                          d_rel, extent, window, part, nullptr);
+                                                          d_rel, extent, window, part, nullptr, nullptr);
     check("attn_multi_split");
     attn_combine_kernel<<<dim3(H, nq), 128, 0, s>>>(sink, part, H, P, v_inv_scale, out);
     check("attn_multi_combine");
@@ -6637,7 +6658,8 @@ void mv_blocks(int type, const uint8_t* W, int N, int K, const float* x, float* 
 template <class KV>
 void attn_decode_impl(const float* q, const float* r, const float* sink, const KV* kc, const KV* vc, int kv_cap, int H,
                       int Hkv, int D, int k0, int nk, int qpos, float qk_scale, float v_inv_scale, const float* proj,
-                      int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s) {
+                      int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s,
+                      const uint8_t* block_skip) {
     if (D != 128 || d_rel > 32) {
         std::fprintf(stderr, "ik2::k::attn_decode: D %d, d_rel %d\n", D, d_rel);
         std::abort();
@@ -6652,7 +6674,7 @@ void attn_decode_impl(const float* q, const float* r, const float* sink, const K
     }
     float* part = scratch;
     attn_split_kernel<KV><<<dim3(H, P), 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0, nk, qpos, qk_scale, proj, d_rel,
-                                                      extent, window, part, nullptr);
+                                                      extent, window, part, nullptr, block_skip);
     check("attn_decode_split");
     attn_combine_kernel<<<dim3(H, 1), 128, 0, s>>>(sink, part, H, P, v_inv_scale, out);
     check("attn_decode_combine");
@@ -6662,22 +6684,23 @@ void attn_decode(const float* q, const float* r, const float* sink, const float*
                  int D, int k0, int nk, int qpos, float qk_scale, const float* proj, int d_rel, int extent, int window,
                  float* scratch, float* out, cudaStream_t s) {
     attn_decode_impl(q, r, sink, kc, vc, 0, H, Hkv, D, k0, nk, qpos, qk_scale, 1.0f, proj, d_rel, extent, window,
-                     scratch, out, s);
+                     scratch, out, s, nullptr);
 }
 
 void attn_decode_f16(const float* q, const float* r, const float* sink, const uint16_t* kc, const uint16_t* vc,
                      int kv_cap, int H, int Hkv, int D, int k0, int nk, int qpos, float qk_scale, const float* proj,
-                     int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s) {
+                     int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s,
+                     const uint8_t* block_skip) {
     attn_decode_impl(q, r, sink, kc, vc, kv_cap, H, Hkv, D, k0, nk, qpos, qk_scale, 1.0f, proj, d_rel, extent, window,
-                     scratch, out, s);
+                     scratch, out, s, block_skip);
 }
 
 void attn_decode_fp8(const float* q, const float* r, const float* sink, const uint8_t* kc, const uint8_t* vc,
                      int kv_cap, int H, int Hkv, int D, int k0, int nk, int qpos, float qk_scale,
                      float v_inv_scale, const float* proj, int d_rel, int extent, int window, float* scratch,
-                     float* out, cudaStream_t s) {
+                     float* out, cudaStream_t s, const uint8_t* block_skip) {
     attn_decode_impl(q, r, sink, kc, vc, kv_cap, H, Hkv, D, k0, nk, qpos, qk_scale, v_inv_scale, proj, d_rel, extent,
-                     window, scratch, out, s);
+                     window, scratch, out, s, block_skip);
 }
 
 void q8_tile(const int8_t* q, const uint16_t* d, int N, int K, const uint16_t* x, int T, float* y, int ldy,
@@ -6771,9 +6794,10 @@ void prep_qkv_r_fp8_at(float* q, const float* q_clip, const float* k_in, uint8_t
 
 void attn_decode_f16_at(const float* q, const float* r, const float* sink, const uint16_t* kc, const uint16_t* vc,
                         int kv_cap, int H, int Hkv, const int* pos, int P, float qk_scale, const float* proj,
-                        int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s) {
+                        int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s,
+                        const uint8_t* block_skip) {
     attn_split_kernel<uint16_t><<<dim3(H, P), 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, 0, 0, 0, qk_scale, proj,
-                                                            d_rel, extent, window, scratch, pos);
+                                                            d_rel, extent, window, scratch, pos, block_skip);
     check("attn_decode_f16_at (split)");
     attn_combine_kernel<<<dim3(H, 1), 128, 0, s>>>(sink, scratch, H, P, 1.0f, out);
     check("attn_decode_f16_at (combine)");
@@ -6781,9 +6805,9 @@ void attn_decode_f16_at(const float* q, const float* r, const float* sink, const
 void attn_decode_fp8_at(const float* q, const float* r, const float* sink, const uint8_t* kc, const uint8_t* vc,
                         int kv_cap, int H, int Hkv, const int* pos, int P, float qk_scale, float v_inv_scale,
                         const float* proj, int d_rel, int extent, int window, float* scratch, float* out,
-                        cudaStream_t s) {
+                        cudaStream_t s, const uint8_t* block_skip) {
     attn_split_kernel<uint8_t><<<dim3(H, P), 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, 0, 0, 0, qk_scale, proj, d_rel,
-                                                           extent, window, scratch, pos);
+                                                           extent, window, scratch, pos, block_skip);
     check("attn_decode_fp8_at (split)");
     attn_combine_kernel<<<dim3(H, 1), 128, 0, s>>>(sink, scratch, H, P, v_inv_scale, out);
     check("attn_decode_fp8_at (combine)");

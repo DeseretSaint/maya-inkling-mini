@@ -1750,23 +1750,40 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
     const int window = Ly.sliding ? c.window : (1 << 30);
     const int k0 = Ly.sliding ? std::max(0, pos0 - c.window + 1) : 0;
     const int nk = pos0 + T - k0;
-    // (P5-4b: this is where a global visit's gate lands - alspec::plan over the probe kernel's per-block mass
-    //  turns into the drop mask the launches below read.  Nothing in this build produces that mass, so the
-    //  exact span is always read; see g_alspec and src/ik2/ik2_alspec.hpp.)
     const float one = 1.0f, zero = 0.0f;
     const float qk_scale = 1.0f / std::sqrt((float) c.D);
     const int attn_kv_cap = Ly.sliding ? Ly.kv_cap : 0;
+    // IK2_ALSPEC (P5-4b): a global visit's decode token is gated here.  The probe scores the visit's 128-key blocks
+    // with this token's q (an FP16 copy of it), the plan turns that into the drop mask, and the launches below read
+    // it.  (T > 1 - a prefill chunk - is never gated: its queries are not one token's, and the policy is a decode one.)
+    const uint8_t* alspec_skip = nullptr;
+    if (g_alspec.enabled && !Ly.sliding && T == 1 && !g_tier_graph && Ly.alspec_mask && c.H <= 24) {
+        k::to_f16(q_p, (size_t) HD, W.x16, g_s);
+        if (g_kv_fp8)
+            k::alspec_gate_fp8(W.x16, Ly.kc8, c.H, c.KV, nullptr, pos0, qk_scale * k_inv, r_p, Ly.rel_proj, c.d_rel,
+                               extent, g_alspec_probe, g_alspec.verify_stride, g_alspec.seed, Ly.alspec_visit,
+                               Ly.alspec_nblocks, Ly.alspec_est, Ly.alspec_exact, g_s);
+        else
+            k::alspec_gate_f16(W.x16, Ly.kc, c.H, c.KV, nullptr, pos0, qk_scale, r_p, Ly.rel_proj, c.d_rel, extent,
+                               g_alspec_probe, g_alspec.verify_stride, g_alspec.seed, Ly.alspec_visit,
+                               Ly.alspec_nblocks, Ly.alspec_est, Ly.alspec_exact, g_s);
+        k::alspec_plan(Ly.alspec_est, Ly.alspec_exact, Ly.alspec_nblocks, nullptr, pos0, g_alspec.tau,
+                       g_alspec.tau_total, g_alspec.keep_first, g_alspec.keep_recent, g_alspec.min_keep,
+                       Ly.alspec_mask, Ly.alspec_cnt, g_s);
+        alspec_skip = Ly.alspec_mask;
+    }
     if (T == 1) {
         if (g_kv_fp8) {
             k::attn_decode_fp8(q_p, r_p, sink_p, Ly.kc8, Ly.vc8, attn_kv_cap, c.H, c.KV, c.D, k0, nk, pos0,
-                               qk_scale * k_inv, v_inv, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
+                               qk_scale * k_inv, v_inv, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s,
+                               alspec_skip);
         } else if (g_tier_graph) {   // (the same split count the host would pick, the position from W.pos)
             const int P = std::min(128, std::max(1, (nk + 63) / 64));
             k::attn_decode_f16_at(q_p, r_p, sink_p, Ly.kc, Ly.vc, attn_kv_cap, c.H, c.KV, W.pos, P, qk_scale,
                                   Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
         } else {
             k::attn_decode_f16(q_p, r_p, sink_p, Ly.kc, Ly.vc, attn_kv_cap, c.H, c.KV, c.D, k0, nk, pos0, qk_scale,
-                               Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
+                               Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s, alspec_skip);
         }
     } else if (T <= 8 && g_group && g_group_attn) {
         if (g_kv_fp8) {
@@ -4460,7 +4477,14 @@ void alspec_report(Model& M) {
         blk += h[0], drop += h[1], chk += h[2], fail += h[3], ppm += h[4], plans += h[5];
         ++nv;
     }
-    if (!nv || !plans) return;
+    if (!nv) {
+        std::fprintf(stderr, "IK2_ALSPEC: no gated visit ran - no global visit had gate buffers\n");
+        return;
+    }
+    if (!plans) {
+        std::fprintf(stderr, "IK2_ALSPEC: the gate planned nothing (%lld visits had counters)\n", (long long) nv);
+        return;
+    }
     std::fprintf(stderr,
                  "IK2_ALSPEC: %d global visits, %lld plans, %lld blocks -> %lld dropped (%.1f%%), dropped mass %.3f%% of "
                  "a visit's, verify sample %lld blocks / %lld above tau\n",
