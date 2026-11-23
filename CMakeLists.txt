@@ -959,6 +959,11 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     add_executable(ik2_dense_bench tests/ik2_dense_bench.cu)
     target_link_libraries(ik2_dense_bench PRIVATE ik2_kernels ${_strata_gpu_blas_target})
     target_include_directories(ik2_dense_bench PRIVATE include)
+    # S6's numerical gate: the fused prefill SwiGLU's equivalence test, host only (no device, no model) -
+    # the activation against its pre-refactor expression, the scratch round trip, and the dot's order.
+    add_executable(ik2_swiglu_cap_test tests/ik2_swiglu_cap_test.cpp)
+    target_include_directories(ik2_swiglu_cap_test PRIVATE src/ik2)
+    target_compile_options(ik2_swiglu_cap_test PRIVATE -Wall -Wextra)
   endif()
   if((STRATA_ENABLE_CUDA AND (_mm3_archs OR NOT _mm3_filter)) OR STRATA_ENABLE_HIP)
     # (a GGUF's weights - tools/mm3/pack_gguf.py, MiniMax's Maya quants: maya-ds4's ggml block-type kernels, src/ds4/ds4_iq,

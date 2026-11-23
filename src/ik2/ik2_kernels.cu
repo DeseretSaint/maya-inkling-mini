@@ -1,6 +1,7 @@
 // src/ik2/ik2_kernels.cu - maya-ik2's kernels (the interface and the conventions: ik2_kernels.cuh).
 #include "ik2_kernels.cuh"
 #include "ik2_iq_tables.h"
+#include "ik2_swiglu_cap.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_fp8.h>
@@ -2089,7 +2090,7 @@ __global__ void swiglu_cap_kernel(const uint16_t* gu, int n, int F, const float*
     const size_t r = i / F, c = i % F;
     const float g = h2f(gu[r * 2 * F + c]) * sg[r];
     const float u = h2f(gu[r * 2 * F + F + c]) * su[r];
-    h[i] = f2h(gcap * tanhf(g / gcap) * (1.0f / (1.0f + expf(-g))) * ucap * tanhf(u / ucap));
+    h[i] = f2h(ik2::swiglu_cap_pair(g, u, gcap, ucap));
 }
 
 __global__ void moe_combine_kernel(const uint16_t* y, const int* inv, const float* wt, int T, int K, int C, float* out,
@@ -2109,7 +2110,55 @@ __global__ void swiglu_cap_f32_kernel(const float* gu, int n, int F, const float
     const size_t r = i / F, c = i % F;
     const float g = gu[r * 2 * F + c] * sg[r];
     const float u = gu[r * 2 * F + F + c] * su[r];
-    h[i] = f2h(gcap * tanhf(g / gcap) * (1.0f / (1.0f + expf(-g))) * ucap * tanhf(u / ucap));
+    h[i] = f2h(ik2::swiglu_cap_pair(g, u, gcap, ucap));
+}
+
+// ---- The fused prefill expert epilogue.  The gate/up product and its activation in one pass, so the
+// [rows][2 F] FP32 gate/up pair never reaches DRAM: swiglu_cap_f32's read of that scratch was the whole
+// reason it existed.  One block owns BF feature rows of one expert over its BT gathered token rows; the
+// two weight rows a feature needs (gate f0 + r, up F + f0 + r) are the same for every token, so they are
+// read once per k tile and shared.  FP16 operands, FP32 sum accumulated in 64-value blocks then added
+// left to right (identical to ik2::dot_f16_f32, which the host test replays), the activation in
+// registers, FP16 out.  Only the summation order of the dot differs from the hipBLAS + swiglu_cap_f32
+// pair; the activation itself is ik2::swiglu_cap_pair, the same call the unfused kernels make.
+//   grid: (F / BF, ceil(rows / BT)), block: BF * BT threads.
+template <int BT, int BF, int BK>
+__global__ void gate_up_swiglu_f16_kernel(const uint16_t* __restrict__ w, int C, int F,
+                                          const uint16_t* __restrict__ x, int x_ld, int rows,
+                                          const float* __restrict__ sg, const float* __restrict__ su, float gcap,
+                                          float ucap, uint16_t* __restrict__ h, int h_ld) {
+    static_assert(BT * BF == 256, "one output per thread");
+    __shared__ uint16_t xs[BT][BK + 1];        // (+1: keeps a row's bank rotated between the tiles)
+    __shared__ uint16_t ws[2 * BF][BK + 1];
+    const int f0 = blockIdx.x * BF, t0 = blockIdx.y * BT;
+    const int tid = threadIdx.x, tf = tid / BF, ff = tid % BF;   // this thread's token row and feature row
+    float ag = 0.0f, au = 0.0f;
+    for (int k0 = 0; k0 < C; k0 += BK) {
+        for (int i = tid; i < BT * BK; i += BT * BF) {
+            const int r = i / BK, kk = i - r * BK;
+            const int tr = t0 + r;
+            xs[r][kk] = tr < rows ? x[(size_t) tr * x_ld + k0 + kk] : (uint16_t) 0;
+        }
+        for (int i = tid; i < 2 * BF * BK; i += BT * BF) {
+            const int r = i / BK, kk = i - r * BK;
+            const int wrow = r < BF ? f0 + r : F + f0 + (r - BF);   // gate f0 + r, then up F + f0 + r
+            ws[r][kk] = w[(size_t) wrow * C + k0 + kk];
+        }
+        __syncthreads();
+        float bg = 0.0f, bu = 0.0f;
+        for (int kk = 0; kk < BK; ++kk) {
+            const float xv = ik2::h2f(xs[tf][kk]);
+            bg += ik2::h2f(ws[ff][kk]) * xv;
+            bu += ik2::h2f(ws[BF + ff][kk]) * xv;
+        }
+        ag += bg, au += bu;
+        __syncthreads();
+    }
+    const int row = t0 + tf;
+    if (row < rows) {
+        h[(size_t) row * h_ld + f0 + ff] = ik2::gate_up_swiglu_f16(ag, au, sg ? sg[row] : 1.0f,
+                                                                  su ? su[row] : 1.0f, gcap, ucap);
+    }
 }
 
 // one token's moe_combine_f32 and the conv4_res after it in one launch: out = conv(sum_k wt[k] y[inv[k]]) + res
@@ -2987,7 +3036,7 @@ __global__ void nv_limb_mv(const uint8_t* const* blobs, const NvInput* packed, s
     if (lane) return;
     if (Gate) {
         const float g = a * (sg ? sg[slot] : 1.f), u = b * (su ? su[slot] : 1.f);
-        hidden[(size_t)slot * F + r] = f2h(gcap * tanhf(g / gcap) * (1.f / (1.f + expf(-g))) * ucap * tanhf(u / ucap));
+        hidden[(size_t)slot * F + r] = f2h(ik2::swiglu_cap_pair(g, u, gcap, ucap));
     } else {
         y[(size_t)slot * C + r] = a;
         y[(size_t)slot * C + r + 1] = b;
@@ -3128,7 +3177,7 @@ __global__ void grouped_expert_mma(const uint8_t* const* blobs, const int* tok, 
         if (Gate) {
             const float g = a0 * (sg ? sg[dst] : 1.f), u = a1 * (su ? su[dst] : 1.f);
             hidden[(size_t)dst * F + r] =
-                f2h(gcap * tanhf(g / gcap) * (1.f / (1.f + expf(-g))) * ucap * tanhf(u / ucap));
+                f2h(ik2::swiglu_cap_pair(g, u, gcap, ucap));
         } else {
             out[(size_t)dst * C + r] = a0;
             out[(size_t)dst * C + r + 8] = a1;
@@ -3261,7 +3310,7 @@ grouped_expert_wmma_kernel(const uint8_t* const* __restrict__ blobs, const int* 
             const float g = tot[r * 16 + col] * (sg ? sg[dst] : 1.f);
             const float u = tot[(r + 8) * 16 + col] * (su ? su[dst] : 1.f);
             hidden[(size_t) dst * F + r0 + r] =
-                f2h(gcap * tanhf(g / gcap) * (1.f / (1.f + expf(-g))) * ucap * tanhf(u / ucap));
+                f2h(ik2::swiglu_cap_pair(g, u, gcap, ucap));
         }
     } else {
 #pragma unroll
@@ -3340,7 +3389,7 @@ experts_mma_wmma_kernel(const uint8_t* const* __restrict__ blob, size_t off, int
         if constexpr (Gate) {
             const float g = tot * (sg ? sg[slot] : 1.0f), u = totu * (su ? su[slot] : 1.0f);
             hidden[(size_t) slot * F + r0 + r] =
-                f2h(gcap * tanhf(g / gcap) * (1.f / (1.f + expf(-g))) * ucap * tanhf(u / ucap));
+                f2h(ik2::swiglu_cap_pair(g, u, gcap, ucap));
         } else {
             y[(size_t) slot * C + r0 + r] = tot;
         }
@@ -3414,7 +3463,7 @@ experts_mma_kernel(const uint8_t* const* __restrict__ blob, size_t off, int C, i
     if (Gate) {
         const float gg = tot.x * (sg ? sg[slot] : 1.0f), u = tot.y * (su ? su[slot] : 1.0f);
         hidden[(size_t) slot * F + r] =
-            f2h(gcap * tanhf(gg / gcap) * (1.0f / (1.0f + expf(-gg))) * ucap * tanhf(u / ucap));
+            f2h(ik2::swiglu_cap_pair(gg, u, gcap, ucap));
     } else {
         y[(size_t) slot * C + r] = tot.x;
         y[(size_t) slot * C + r + 8] = tot.y;
@@ -3466,7 +3515,7 @@ __global__ void experts_gate_up_swiglu_kernel(const uint8_t* const* blob, const 
         if ((threadIdx.x & 31) == 0) {
             const float g = vg * sgs, u = vu * sus;
             h[(size_t) (orow ? orow[s] : s) * h_ld + r] =
-                f2h(gcap * tanhf(g / gcap) * (1.0f / (1.0f + expf(-g))) * ucap * tanhf(u / ucap));
+                f2h(ik2::swiglu_cap_pair(g, u, gcap, ucap));
         }
     }
 }
@@ -3969,7 +4018,7 @@ __device__ __forceinline__ void experts_gate_up_swiglu_g_run(const uint8_t* bl, 
                 const int ro = orow_g[t];
                 const float g = og[t] * (sg ? sg[ro] : 1.0f);
                 const float u = ou[t] * (su ? su[ro] : 1.0f);
-                h[(size_t) ro * F + r] = f2h(gcap * tanhf(g / gcap) * (1.0f / (1.0f + expf(-g))) * ucap * tanhf(u / ucap));
+                h[(size_t) ro * F + r] = f2h(ik2::swiglu_cap_pair(g, u, gcap, ucap));
             }
         }
     }
@@ -5433,7 +5482,7 @@ experts_block_gu_kernel(const uint8_t* const* __restrict__ blob, const int* __re
         if (mem < n) {
             const int slot = row_g[grp * kGroupMax + mem];
             const float gg = (tot.x + tot.y) * (sg ? sg[slot] : 1.0f), u = (tot.z + tot.w) * (su ? su[slot] : 1.0f);
-            h[(size_t) slot * F + r] = f2h(gcap * tanhf(gg / gcap) * (1.0f / (1.0f + expf(-gg))) * ucap * tanhf(u / ucap));
+            h[(size_t) slot * F + r] = f2h(ik2::swiglu_cap_pair(gg, u, gcap, ucap));
         }
     }
 }
@@ -5608,7 +5657,7 @@ experts_block_gu_q8_kernel(const uint8_t* const* __restrict__ blob, const int* _
         if (mem < n) {
             const int slot = row_g[grp * kGroupMax + mem];
             const float gg = (tot.x + tot.y) * (sg ? sg[slot] : 1.0f), u = (tot.z + tot.w) * (su ? su[slot] : 1.0f);
-            h[(size_t) slot * F + r] = f2h(gcap * tanhf(gg / gcap) * (1.0f / (1.0f + expf(-gg))) * ucap * tanhf(u / ucap));
+            h[(size_t) slot * F + r] = f2h(ik2::swiglu_cap_pair(gg, u, gcap, ucap));
         }
     }
 }
@@ -5943,6 +5992,18 @@ void swiglu_cap_f32(const float* gu, int n, int F, const float* sg, const float*
     if (n <= 0) return;
     swiglu_cap_f32_kernel<<<grid((size_t) n * F), kBlk, 0, s>>>(gu, n, F, sg, su, gcap, ucap, h);
     check("swiglu_cap_f32");
+}
+
+bool gate_up_swiglu_f16_fits(int C, int F) { return F % 8 == 0 && F > 0 && C % 64 == 0 && C > 0; }
+
+void gate_up_swiglu_f16(const uint16_t* w16, int C, int F, const uint16_t* x, int x_ld, int rows, const float* sg,
+                        const float* su, float gcap, float ucap, uint16_t* h, int h_ld, cudaStream_t s) {
+    if (rows <= 0) return;
+    constexpr int BT = 32, BF = 8, BK = 64;
+    const dim3 g((unsigned) (F / BF), (unsigned) ((rows + BT - 1) / BT));
+    gate_up_swiglu_f16_kernel<BT, BF, BK><<<g, BT * BF, 0, s>>>(w16, C, F, x, x_ld, rows, sg, su, gcap, ucap, h,
+                                                                h_ld);
+    check("gate_up_swiglu_f16");
 }
 void moe_combine_f32(const float* y, const int* inv, const float* wt, int T, int K, int C, float* out, bool add,
                      cudaStream_t s) {
