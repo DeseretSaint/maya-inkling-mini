@@ -356,11 +356,30 @@ size_t attn_decode_mma_scratch(int H, int n_split);
 void attn_decode_mma_f16(const uint16_t* q16, const float* r, const float* sink, const uint16_t* kc, const uint16_t* vc,
                          int kv_cap, int H, int Hkv, const int* pos, int qpos, int n_split, float qk_scale,
                          const float* proj, int d_rel, int extent, int window, float* scratch, float* out,
-                         const float* gate, uint16_t* out16, cudaStream_t s);
+                         const float* gate, uint16_t* out16, cudaStream_t s, const uint8_t* block_skip = nullptr);
 void attn_decode_mma_fp8(const uint16_t* q16, const float* r, const float* sink, const uint8_t* kc, const uint8_t* vc,
                          int kv_cap, int H, int Hkv, const int* pos, int qpos, int n_split, float qk_scale,
                          float v_inv_scale, const float* proj, int d_rel, int extent, int window, float* scratch,
-                         float* out, const float* gate, uint16_t* out16, cudaStream_t s);
+                         float* out, const float* gate, uint16_t* out16, cudaStream_t s,
+                         const uint8_t* block_skip = nullptr);
+
+/// ALSpec gated attention (IK2_ALSPEC, P5-4b).  The probe scores every 128-key block of one global visit against
+/// every query head: a key in `stride` of them for the estimate (est[b] = (max score, sum of exp over the block's
+/// keys scaled up from the sample)), and all of the block's keys for the hash sample `verify_stride` names
+/// (exact[b], NaN when the block was not sampled).  The plan turns that into `mask` (1 = the block is not read):
+/// blocks whose share of the visit's mass is under tau, smallest first, while the drops carry at most tau_total;
+/// the first keep_first / last keep_recent blocks and min_keep blocks are kept, and cnt[0..4] count the blocks,
+/// the drops, the verification sample, its failures, and the dropped mass in millionths.  nk: the visit's keys.
+void alspec_gate_f16(const uint16_t* q16, const uint16_t* kc, int H, int Hkv, const int* pos, int qpos,
+                     float qk_scale, const float* r, const float* proj, int d_rel, int extent, int stride,
+                     int verify_stride, uint64_t seed, int visit, int n_blocks, float2* est, float2* exact,
+                     cudaStream_t s);
+void alspec_gate_fp8(const uint16_t* q16, const uint8_t* kc, int H, int Hkv, const int* pos, int qpos, float qk_scale,
+                     const float* r, const float* proj, int d_rel, int extent, int stride, int verify_stride,
+                     uint64_t seed, int visit, int n_blocks, float2* est, float2* exact, cudaStream_t s);
+void alspec_plan(const float2* est, const float2* exact, int n_blocks, const int* pos, int qpos, float tau,
+                 float tau_total, int keep_first, int keep_recent, int min_keep, uint8_t* mask, int* cnt,
+                 cudaStream_t s);
 
 // ---- speculative decoding: the draft model's (Inkling 2's DSpark drafter, mtp.safetensors) and the rollback's
 

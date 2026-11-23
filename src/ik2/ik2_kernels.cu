@@ -1725,7 +1725,8 @@ __global__ void __launch_bounds__(kWaNW * 32, 4)
 attn_decode_mma_kernel(const uint16_t* __restrict__ q16, const KVT* __restrict__ kc, const KVT* __restrict__ vc,
                        int kv_cap, int H, int Hkv, const int* pos_d, int qpos, float qk_scale,
                        const float* __restrict__ r, const float* __restrict__ proj, int d_rel, bool rel4, int extent,
-                       int window, int n_split, float* __restrict__ o_part, float2* __restrict__ ml_part) {
+                       int window, int n_split, float* __restrict__ o_part, float2* __restrict__ ml_part,
+                       const uint8_t* __restrict__ block_skip) {
     constexpr bool F8 = sizeof(KVT) == 1;
     if (pos_d) qpos = *pos_d;   // (a token of a replayed graph: its position read here)
     const int lane = threadIdx.x & 31, gr = lane >> 2, tq = lane & 3;
@@ -1762,6 +1763,9 @@ attn_decode_mma_kernel(const uint16_t* __restrict__ q16, const KVT* __restrict__
 
     for (int st = st0; st < st1; ++st) {
         const int kt = k_lo + st * 16, kmax = qpos - kt;
+        // IK2_ALSPEC (P5-4b): a 128-key block the gate probe found under tau is not read at all.  A global visit's
+        // keys are absolute (kv_cap == 0), so the block index is kt / 128; the mask is the previous step's plan.
+        if (block_skip && kt >= 0 && block_skip[(size_t) kt >> 7]) continue;
         const int row0 = kv_cap > 0 ? kt % kv_cap : kt;
         // a key's row in the cache (a key past the token's: the token's row, its logits masked below)
         auto row = [&](int key) {
@@ -4081,6 +4085,191 @@ __device__ __forceinline__ float4 v_load4<uint8_t>(const uint8_t* vr, int lane) 
     }
     return make_float4(e4m3fn_to_f32(vr[o]), e4m3fn_to_f32(vr[o + 1]), e4m3fn_to_f32(vr[o + 2]),
                        e4m3fn_to_f32(vr[o + 3]));
+}
+
+// ---- ALSpec gated attention (P5-4b): the gate probe and the per-visit plan ---------------------------------
+// The policy is host code (src/ik2/ik2_alspec.hpp); these two kernels are what it was missing: a cheap per-block
+// score, and the mask that attn_decode_mma_kernel reads.  The probe scores a 128-key block against every query
+// head of the visit by reading one key in `stride` of them (a strided read of K, and 1/stride of the arithmetic
+// the decode attention spends on q K^T), keeping the block's maximum score and the sum of exp(score - max).
+// A hash sample of the blocks -- alspec::sampled()'s exact rule, 1 in `verify_stride` -- is scored over ALL its
+// keys as well, so the plan can compare the estimate it dropped with the truth on the sample the policy names.
+__device__ __forceinline__ uint64_t alspec_splitmix64(uint64_t x) {
+    x += 0x9e3779b97f4a7c15ull;
+    x = (x ^ (x >> 30)) * 0xbf58476d1ce4e5b9ull;
+    x = (x ^ (x >> 27)) * 0x94d049bb133111ebull;
+    return x ^ (x >> 31);
+}
+// (the same rule as alspec::sampled() in ik2_alspec.hpp - that header stays host-only, so the hash lives twice)
+__device__ __forceinline__ bool alspec_sampled(int block, int visit, int stride, uint64_t seed) {
+    if (stride <= 1) return true;
+    const uint64_t h = alspec_splitmix64(alspec_splitmix64((uint64_t) (uint32_t) block ^ seed) ^
+                                         (uint64_t) (uint32_t) visit);
+    return h % (uint64_t) stride == 0;
+}
+
+template <class KVT>
+__global__ void __launch_bounds__(128)
+alspec_gate_kernel(const uint16_t* __restrict__ q16, const KVT* __restrict__ kc, int H, int Hkv, const int* pos_d,
+                   int qpos, float qk_scale, const float* __restrict__ r, const float* __restrict__ proj, int d_rel,
+                   int extent, int stride, int verify_stride, uint64_t seed, int visit, int n_blocks,
+                   float2* __restrict__ est, float2* __restrict__ exact) {
+    __shared__ float smq[kFaD * 24];   // (this model: 24 query heads; the host refuses the gate for more)
+    __shared__ float sm_m[4], sm_s[4], sm_me[4], sm_se[4];
+    if (pos_d) qpos = *pos_d;
+    const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5, R = H / Hkv, KD = Hkv * kFaD;
+    for (int i = threadIdx.x; i < H * kFaD; i += 128) smq[i] = h2f(q16[i]);
+    __syncthreads();
+    const int b = blockIdx.x;
+    if (b >= n_blocks) return;
+    const bool ver = alspec_sampled(b, visit, verify_stride, seed);
+    if (!ver && threadIdx.x == 0) exact[b] = make_float2(NAN, NAN);
+    const int j0 = b * 128, j1 = min(qpos + 1, j0 + 128);
+    float m = -INFINITY, s = 0.0f, me = -INFINITY, se = 0.0f;
+    for (int j = j0 + warp; j < j1; j += 4) {
+        const int dist = qpos - j;
+        const bool samp = ((j - j0) % stride) == 0;
+        if (dist < 0 || (!samp && !ver)) continue;
+        const size_t koff = (size_t) j * KD;
+        float mk = -INFINITY, sk = 0.0f;   // this key's 24 heads: online (max, sum of exp)
+        for (int g = 0; g < Hkv; ++g) {
+            const float4 k4 = v_load4(kc + koff + (size_t) g * kFaD, lane);
+            for (int rr = 0; rr < R; ++rr) {
+                const int h = g * R + rr;
+                const float4 q4 = *(const float4*) (smq + h * kFaD + lane * 4);
+                const float a = q4.x * k4.x + q4.y * k4.y + q4.z * k4.z + q4.w * k4.w;
+                float l = wsum(a) * qk_scale;
+                if (dist < extent && lane < d_rel)
+                    l += wsum(__ldg(r + (size_t) h * d_rel + lane) * __ldg(proj + (size_t) dist * d_rel + lane));
+                const float mn = fmaxf(mk, l);
+                sk = (mk == -INFINITY ? 0.0f : sk * __expf(mk - mn)) + __expf(l - mn);
+                mk = mn;
+            }
+        }
+        if (samp) {   // this thread's sampled keys
+            const float mn = fmaxf(m, mk);
+            s = (m == -INFINITY ? 0.0f : s * __expf(m - mn)) + sk * __expf(mk - mn);
+            m = mn;
+        }
+        if (ver) {    // ... and, for the verification sample, all of them
+            const float mn = fmaxf(me, mk);
+            se = (me == -INFINITY ? 0.0f : se * __expf(me - mn)) + sk * __expf(mk - mn);
+            me = mn;
+        }
+    }
+    if (lane == 0) sm_m[warp] = m, sm_s[warp] = s, sm_me[warp] = me, sm_se[warp] = se;
+    __syncthreads();
+    if (threadIdx.x == 0) {
+        auto add = [](float& M, float& S, float m2, float s2) {
+            if (m2 == -INFINITY || !(s2 > 0.0f)) return;
+            const float mn = fmaxf(M, m2);
+            S = (M == -INFINITY ? 0.0f : S * __expf(M - mn)) + s2 * __expf(m2 - mn);
+            M = mn;
+        };
+        float M = -INFINITY, S = 0.0f, ME = -INFINITY, SE = 0.0f;
+        for (int w = 0; w < 4; ++w) add(M, S, sm_m[w], sm_s[w]), add(ME, SE, sm_me[w], sm_se[w]);
+        int n_samp = 0;
+        for (int t = j0; t < j1; ++t)
+            if (((t - j0) % stride) == 0) ++n_samp;
+        const float fs = n_samp > 0 ? (float) (j1 - j0) / (float) n_samp : 1.0f;   // (the estimate covers every key)
+        est[b] = make_float2(M, S * fs);
+        if (ver) exact[b] = make_float2(ME, SE);
+    }
+}
+
+// One visit's plan: the blocks whose estimated share of the visit's mass is under `tau`, smallest first, while the
+// drops carry at most `tau_total`; the first `keep_first` and last `keep_recent` blocks and `min_keep` blocks are
+// never dropped.  (The policy header walks the blocks smallest-first; a threshold bisection reaches the same place -
+// the largest threshold <= tau whose dropped mass fits the budget - and does it without a sort.)  The sample the
+// gate measured exactly is compared against tau here: a dropped block whose true share reaches tau is a gate
+// under-read and is counted (cnt[3]), which is the reading the policy header's `verify` makes.
+__global__ void __launch_bounds__(128)
+alspec_plan_kernel(const float2* __restrict__ est, const float2* __restrict__ exact, int n_blocks, const int* pos_d,
+                   int qpos, float tau, float tau_total, int keep_first, int keep_recent, int min_keep,
+                   uint8_t* __restrict__ mask, int* __restrict__ cnt) {
+    __shared__ float red[128];
+    const int tid = threadIdx.x;
+    if (pos_d) qpos = *pos_d;
+    const int nb = min(n_blocks, (qpos + 1 + 127) / 128);
+    auto reduce_max = [&](float v) {
+        red[tid] = v;
+        __syncthreads();
+        for (int w = 64; w > 0; w >>= 1) {
+            if (tid < w) red[tid] = fmaxf(red[tid], red[tid + w]);
+            __syncthreads();
+        }
+        return red[0];
+    };
+    auto reduce_sum = [&](float v) {
+        red[tid] = v;
+        __syncthreads();
+        for (int w = 64; w > 0; w >>= 1) {
+            if (tid < w) red[tid] += red[tid + w];
+            __syncthreads();
+        }
+        return red[0];
+    };
+    float mx = -INFINITY;
+    for (int b = tid; b < nb; b += 128) mx = fmaxf(mx, est[b].x);
+    mx = reduce_max(mx);
+    auto share_of = [&](const float2 e) {
+        if (e.x == -INFINITY || e.x != e.x) return 0.0f;
+        return __expf(e.x - mx) * e.y;
+    };
+    float tot = 0.0f;
+    for (int b = tid; b < nb; b += 128) tot += share_of(est[b]);
+    tot = reduce_sum(tot);
+    for (int b = nb + tid; b < n_blocks; b += 128) mask[b] = 0;
+    if (!(tot > 0.0f)) {
+        for (int b = tid; b < nb; b += 128) mask[b] = 0;
+        return;
+    }
+    const int head_end = min(keep_first, nb), tail_beg = max(head_end, nb - keep_recent);
+    float lo = 0.0f, hi = tau;
+    for (int it = 0; it < 24; ++it) {
+        const float t = 0.5f * (lo + hi);
+        float sum = 0.0f;
+        for (int b = tid; b < nb; b += 128) {
+            if (b < head_end || b >= tail_beg) continue;
+            const float sh = share_of(est[b]) / tot;
+            if (sh < t) sum += sh;
+        }
+        if (reduce_sum(sum) <= tau_total) lo = t;
+        else hi = t;
+    }
+    const float t = lo;
+    int nskip = 0;
+    float dropped = 0.0f;
+    for (int b = tid; b < nb; b += 128) {
+        const float sh = share_of(est[b]) / tot;
+        const int drop = (b >= head_end && b < tail_beg && sh < t) ? 1 : 0;
+        mask[b] = (uint8_t) drop;
+        nskip += drop;
+        if (drop) dropped += sh;
+    }
+    nskip = (int) reduce_sum((float) nskip);
+    dropped = reduce_sum(dropped);
+    if (nskip > nb - max(1, min_keep)) {   // (never leave a visit with fewer than min_keep blocks)
+        for (int b = tid; b < nb; b += 128) mask[b] = 0;
+        nskip = 0;
+        dropped = 0.0f;
+    }
+    int vchk = 0, vfail = 0;
+    for (int b = tid; b < nb; b += 128) {
+        if (!mask[b]) continue;
+        const float2 e = exact[b];
+        if (e.x != e.x) continue;                       // (not in the sample: the probe measured no truth here)
+        vchk += 1;
+        if (share_of(e) / tot >= tau) vfail += 1;
+    }
+    if (tid == 0) {
+        cnt[0] += nb;
+        cnt[1] += nskip;
+        cnt[2] += vchk;
+        cnt[3] += vfail;
+        cnt[4] += (int) lrintf(dropped * 1e6f);
+        cnt[5] += 1;
+    }
 }
 
 template <class KV>
@@ -6619,7 +6808,7 @@ template <class KV>
 void attn_decode_mma_impl(const uint16_t* q16, const float* r, const float* sink, const KV* kc, const KV* vc, int kv_cap,
                           int H, int Hkv, const int* pos, int qpos, int n_split, float qk_scale, float v_inv,
                           const float* proj, int d_rel, int extent, int window, float* scratch, float* out,
-                          const float* gate, uint16_t* out16, cudaStream_t s) {
+                          const float* gate, uint16_t* out16, const uint8_t* block_skip, cudaStream_t s) {
     if (H % Hkv || H / Hkv > 8 || n_split < 1 || (kv_cap > 0 && kv_cap < 16)) {
         std::fprintf(stderr, "ik2::k::attn_decode_mma: %d heads on %d, %d splits, a cache of %d\n", H, Hkv, n_split,
                      kv_cap);
@@ -6631,11 +6820,11 @@ void attn_decode_mma_impl(const uint16_t* q16, const float* r, const float* sink
     if (fa_wmma())
         attn_decode_mma_kernel<KV, true><<<dim3((unsigned) Hkv, (unsigned) n_split), kWaNW * 32, 0, s>>>(
             q16, kc, vc, kv_cap, H, Hkv, pos, qpos, qk_scale, r, proj, d_rel, rel4, extent, window, n_split, o_part,
-            ml_part);
+            ml_part, block_skip);
     else
         attn_decode_mma_kernel<KV, false><<<dim3((unsigned) Hkv, (unsigned) n_split), kWaNW * 32, 0, s>>>(
             q16, kc, vc, kv_cap, H, Hkv, pos, qpos, qk_scale, r, proj, d_rel, rel4, extent, window, n_split, o_part,
-            ml_part);
+            ml_part, block_skip);
     check("attn_decode_mma");
     attn_decode_mma_combine_kernel<<<(unsigned) H, kFaD, (size_t) (kFaD + n_split * kWaNW) * sizeof(float), s>>>(
         o_part, ml_part, n_split, H, sink, v_inv, pos, qpos, window, gate, out, out16);
@@ -6644,16 +6833,47 @@ void attn_decode_mma_impl(const uint16_t* q16, const float* r, const float* sink
 void attn_decode_mma_f16(const uint16_t* q16, const float* r, const float* sink, const uint16_t* kc, const uint16_t* vc,
                          int kv_cap, int H, int Hkv, const int* pos, int qpos, int n_split, float qk_scale,
                          const float* proj, int d_rel, int extent, int window, float* scratch, float* out,
-                         const float* gate, uint16_t* out16, cudaStream_t s) {
+                         const float* gate, uint16_t* out16, cudaStream_t s, const uint8_t* block_skip) {
     attn_decode_mma_impl(q16, r, sink, kc, vc, kv_cap, H, Hkv, pos, qpos, n_split, qk_scale, 1.0f, proj, d_rel, extent,
-                         window, scratch, out, gate, out16, s);
+                         window, scratch, out, gate, out16, block_skip, s);
 }
 void attn_decode_mma_fp8(const uint16_t* q16, const float* r, const float* sink, const uint8_t* kc, const uint8_t* vc,
                          int kv_cap, int H, int Hkv, const int* pos, int qpos, int n_split, float qk_scale,
                          float v_inv_scale, const float* proj, int d_rel, int extent, int window, float* scratch,
-                         float* out, const float* gate, uint16_t* out16, cudaStream_t s) {
+                         float* out, const float* gate, uint16_t* out16, cudaStream_t s, const uint8_t* block_skip) {
     attn_decode_mma_impl(q16, r, sink, kc, vc, kv_cap, H, Hkv, pos, qpos, n_split, qk_scale, v_inv_scale, proj, d_rel,
-                         extent, window, scratch, out, gate, out16, s);
+                         extent, window, scratch, out, gate, out16, block_skip, s);
+}
+
+// ---- ALSpec gated attention (P5-4b): the probe, then the plan, then the gated attention ----------------------
+template <class KV>
+void alspec_gate_impl(const uint16_t* q16, const KV* kc, int H, int Hkv, const int* pos, int qpos, float qk_scale,
+                      const float* r, const float* proj, int d_rel, int extent, int stride, int verify_stride,
+                      uint64_t seed, int visit, int n_blocks, float2* est, float2* exact, cudaStream_t s) {
+    alspec_gate_kernel<KV><<<(unsigned) n_blocks, 128, 0, s>>>(q16, kc, H, Hkv, pos, qpos, qk_scale, r, proj, d_rel,
+                                                              extent, stride, verify_stride, seed, visit, n_blocks,
+                                                              est, exact);
+    check("alspec_gate");
+}
+void alspec_gate_f16(const uint16_t* q16, const uint16_t* kc, int H, int Hkv, const int* pos, int qpos,
+                     float qk_scale, const float* r, const float* proj, int d_rel, int extent, int stride,
+                     int verify_stride, uint64_t seed, int visit, int n_blocks, float2* est, float2* exact,
+                     cudaStream_t s) {
+    alspec_gate_impl<uint16_t>(q16, kc, H, Hkv, pos, qpos, qk_scale, r, proj, d_rel, extent, stride, verify_stride,
+                               seed, visit, n_blocks, est, exact, s);
+}
+void alspec_gate_fp8(const uint16_t* q16, const uint8_t* kc, int H, int Hkv, const int* pos, int qpos, float qk_scale,
+                     const float* r, const float* proj, int d_rel, int extent, int stride, int verify_stride,
+                     uint64_t seed, int visit, int n_blocks, float2* est, float2* exact, cudaStream_t s) {
+    alspec_gate_impl<uint8_t>(q16, kc, H, Hkv, pos, qpos, qk_scale, r, proj, d_rel, extent, stride, verify_stride, seed,
+                              visit, n_blocks, est, exact, s);
+}
+void alspec_plan(const float2* est, const float2* exact, int n_blocks, const int* pos, int qpos, float tau,
+                 float tau_total, int keep_first, int keep_recent, int min_keep, uint8_t* mask, int* cnt,
+                 cudaStream_t s) {
+    alspec_plan_kernel<<<1, 128, 0, s>>>(est, exact, n_blocks, pos, qpos, tau, tau_total, keep_first, keep_recent,
+                                         min_keep, mask, cnt);
+    check("alspec_plan");
 }
 
 void unpack_kv_fp8_to_f16(const uint8_t* kc, const uint8_t* vc, int kv_cap, int k0, int nk, int KD,

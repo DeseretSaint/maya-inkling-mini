@@ -264,6 +264,13 @@ struct Layer {
     uint16_t *kc = nullptr, *vc = nullptr;         // FP16 [kv_cap][KV * D] (IK2_KV=f16)
     uint8_t *kc8 = nullptr, *vc8 = nullptr;        // FP8 E4M3 [kv_cap][KV * D] (IK2_KV=fp8)
     int kv_cap = 0;
+    // IK2_ALSPEC (P5-4b), a global visit's gate: every 128-key block's estimated score (max, sum of exp), the
+    // verification sample's exact score (NaN when that block was not sampled), the drop mask the decode attention
+    // reads, and the counters [blocks, drops, verify checked, verify failed, dropped mass in millionths]
+    float2 *alspec_est = nullptr, *alspec_exact = nullptr;
+    uint8_t *alspec_mask = nullptr;
+    int *alspec_cnt = nullptr;
+    int alspec_visit = 0, alspec_nblocks = 0;
     float *h_k, *h_v, *h_attn, *h_mlp;             // conv histories [3][C']
     float *rec_old[4] = {}, *rec_x[4] = {};        // (speculative) the convs' histories and inputs of a verify window
 };
@@ -277,6 +284,10 @@ struct Visit {
     uint16_t *kc = nullptr, *vc = nullptr;
     uint8_t *kc8 = nullptr, *vc8 = nullptr;
     int kv_cap = 0;
+    float2 *alspec_est = nullptr, *alspec_exact = nullptr;   // (IK2_ALSPEC: this visit's gate, see Layer)
+    uint8_t *alspec_mask = nullptr;
+    int *alspec_cnt = nullptr;
+    int alspec_visit = 0, alspec_nblocks = 0;
     float *h_k = nullptr, *h_v = nullptr, *h_attn = nullptr, *h_mlp = nullptr;
     float *rec_old[4] = {}, *rec_x[4] = {};
 };
@@ -296,6 +307,8 @@ inline Layer& bind_visit(Model& M, int v) {
     const Visit& Vi = M.V[v];
     Layer& Ly = M.L[Vi.l];
     Ly.kc = Vi.kc, Ly.vc = Vi.vc, Ly.kc8 = Vi.kc8, Ly.vc8 = Vi.vc8, Ly.kv_cap = Vi.kv_cap;
+    Ly.alspec_est = Vi.alspec_est, Ly.alspec_exact = Vi.alspec_exact, Ly.alspec_mask = Vi.alspec_mask;
+    Ly.alspec_cnt = Vi.alspec_cnt, Ly.alspec_visit = Vi.alspec_visit, Ly.alspec_nblocks = Vi.alspec_nblocks;
     Ly.h_k = Vi.h_k, Ly.h_v = Vi.h_v, Ly.h_attn = Vi.h_attn, Ly.h_mlp = Vi.h_mlp;
     for (int i = 0; i < 4; ++i) Ly.rec_old[i] = Vi.rec_old[i], Ly.rec_x[i] = Vi.rec_x[i];
     return Ly;
@@ -376,6 +389,7 @@ bool g_flash = true;   // IK2_FLASH=0: the prefill's attention (FP16 KV) through
 // does not have, so even with IK2_ALSPEC=1 the exact path is taken and one line says so.  Off by default,
 // and nothing below is reached unless it is set.
 strata::ik2::alspec::Policy g_alspec;
+int g_alspec_probe = 8;   // IK2_ALSPEC_PROBE: one key in N of a block is scored to estimate its mass (1: all of them)
 int g_n_sm = 0;
 bool g_group = true;   // IK2_GROUP=0: 2 .. 8 tokens' experts a slot at a time, their attention a head at a time
 bool g_group_exp = true, g_group_attn = true;   // (IK2_GROUP=1: the experts grouped only, 2: the attention only)
@@ -2667,15 +2681,35 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
         const int ring = Ly.sliding ? Ly.kv_cap : 0;
         const int ns = Ly.sliding ? std::min(g_mma_split, std::max(1, (c.window + 63) / 64)) : g_mma_split;
         uint16_t* q16 = mma ? W.x16 : nullptr;
+        // IK2_ALSPEC (P5-4b): on a global visit's token, score every 128-key block of the visit's cache with the
+        // token's own q (IK2_ALSPEC_PROBE: one key in N of a block), plan the drop mask against tau / tau_total,
+        // and hand it to the attention.  (Called after prep_* wrote this token's K, so the probe sees it.)
+        auto alspec_mask_for = [&]() -> const uint8_t* {
+            if (!g_alspec.enabled || Ly.sliding || !mma || !Ly.alspec_mask || c.H > 24) return nullptr;
+            const int nb = Ly.alspec_nblocks;
+            if (g_kv_fp8)
+                k::alspec_gate_fp8(q16, Ly.kc8, c.H, c.KV, W.pos, 0, qk_scale / k_scale, r_p, Ly.rel_proj, c.d_rel,
+                                   extent, g_alspec_probe, g_alspec.verify_stride, g_alspec.seed, Ly.alspec_visit,
+                                   nb, Ly.alspec_est, Ly.alspec_exact, g_s);
+            else
+                k::alspec_gate_f16(q16, Ly.kc, c.H, c.KV, W.pos, 0, qk_scale, r_p, Ly.rel_proj, c.d_rel, extent,
+                                   g_alspec_probe, g_alspec.verify_stride, g_alspec.seed, Ly.alspec_visit, nb,
+                                   Ly.alspec_est, Ly.alspec_exact, g_s);
+            k::alspec_plan(Ly.alspec_est, Ly.alspec_exact, nb, W.pos, 0, g_alspec.tau, g_alspec.tau_total,
+                           g_alspec.keep_first, g_alspec.keep_recent, g_alspec.min_keep, Ly.alspec_mask,
+                           Ly.alspec_cnt, g_s);
+            return Ly.alspec_mask;
+        };
         if (g_kv_fp8) {
             k::prep_qkv_r_fp8_at(q_p, Ly.q_clip, W.kconv, Ly.kc8, W.vconv, Ly.vc8, r_p, Ly.r_clip, c.H, c.KV, c.D, c.d_rel,
                                  c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha, c.n_floor, Ly.kv_cap,
                                  k_scale, v_scale, q16, g_s, Ly.sink16, W.xq, C, W.sink);
-            if (mma)
+            if (mma) {
+                const uint8_t* skip = alspec_mask_for();
                 k::attn_decode_mma_fp8(q16, r_p, W.sink, Ly.kc8, Ly.vc8, ring, c.H, c.KV, W.pos, 0, ns,
                                        qk_scale / k_scale, 1.0f / v_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg,
-                                       W.o, gate_p, W.x16, g_s);
-            else
+                                       W.o, gate_p, W.x16, g_s, skip);
+            } else
                 k::attn_decode_fp8_at(q_p, r_p, W.sink, Ly.kc8, Ly.vc8, Ly.sliding ? Ly.kv_cap : 0, c.H, c.KV, W.pos, P,
                                       qk_scale / k_scale, 1.0f / v_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg,
                                       W.o, g_s);
@@ -2683,10 +2717,11 @@ void fast_token_launches(Model& M, Work& W, OutMode out_mode) {
             k::prep_qkv_r_f16_at(q_p, Ly.q_clip, W.kconv, Ly.kc, W.vconv, Ly.vc, r_p, Ly.r_clip, c.H, c.KV, c.D, c.d_rel,
                                  c.qk_clip, c.rel_clip, c.eps, W.pos, !Ly.sliding, c.alpha, c.n_floor, Ly.kv_cap, q16,
                                  g_s, Ly.sink16, W.xq, C, W.sink);
-            if (mma)
+            if (mma) {
+                const uint8_t* skip = alspec_mask_for();
                 k::attn_decode_mma_f16(q16, r_p, W.sink, Ly.kc, Ly.vc, ring, c.H, c.KV, W.pos, 0, ns, qk_scale,
-                                       Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, gate_p, W.x16, g_s);
-            else
+                                       Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, gate_p, W.x16, g_s, skip);
+            } else
                 k::attn_decode_f16_at(q_p, r_p, W.sink, Ly.kc, Ly.vc, Ly.sliding ? Ly.kv_cap : 0, c.H, c.KV, W.pos, P,
                                       qk_scale, Ly.rel_proj, c.d_rel, extent, window, W.lg, W.o, g_s);
         }
@@ -4409,6 +4444,30 @@ void embed_row(Model& M, int t, float* raw, float* out) {
 
 }  // namespace
 
+// IK2_ALSPEC: what the gate planned over a run - the block plans, the drops, the dropped share of a visit's mass,
+// and the verification sample (the blocks the probe also measured over every key, and how many of those the sampled
+// estimate had under-read past tau).  Printed at exit, after the generation line, so a run's own log carries it.
+void alspec_report(Model& M) {
+    if (!g_alspec.enabled) return;
+    CU(cudaStreamSynchronize(g_s));
+    long long blk = 0, drop = 0, chk = 0, fail = 0, ppm = 0, plans = 0;
+    int nv = 0;
+    for (int v = 0; v < (int) M.V.size(); ++v) {
+        const Visit& Vi = M.V[v];
+        if (!Vi.alspec_cnt) continue;
+        int h[8] = {0, 0, 0, 0, 0, 0, 0, 0};
+        CU(cudaMemcpy(h, Vi.alspec_cnt, sizeof h, cudaMemcpyDeviceToHost));
+        blk += h[0], drop += h[1], chk += h[2], fail += h[3], ppm += h[4], plans += h[5];
+        ++nv;
+    }
+    if (!nv || !plans) return;
+    std::fprintf(stderr,
+                 "IK2_ALSPEC: %d global visits, %lld plans, %lld blocks -> %lld dropped (%.1f%%), dropped mass %.3f%% of "
+                 "a visit's, verify sample %lld blocks / %lld above tau\n",
+                 nv, plans, blk, drop, blk ? 100.0 * (double) drop / (double) blk : 0.0,
+                 plans ? 100.0 * (double) ppm / 1e6 / (double) plans : 0.0, chk, fail);
+}
+
 int main(int argc, char** argv) {
     std::string model, toks, dump, draft_path;
     int gen = 16, chunk = 2048, ctx = 262144, threads = 8, n_gpu = 1;
@@ -4457,11 +4516,13 @@ int main(int argc, char** argv) {
     g_tier_graph = getenv("IK2_GRAPH") && !g_fast_want ? std::atoi(getenv("IK2_GRAPH")) : 0;
     g_flash = !(getenv("IK2_FLASH") && !std::atoi(getenv("IK2_FLASH")));
     g_alspec = strata::ik2::alspec::Policy::from_env();
+    if (const char* v = std::getenv("IK2_ALSPEC_PROBE"); v && *v) g_alspec_probe = std::max(1, std::atoi(v));
     if (g_alspec.enabled)
         std::fprintf(stderr,
-                     "IK2_ALSPEC: policy armed - tau %g, tau_total %g, block %d keys, verify 1/%d; this build has no "
-                     "gate-score probe, so the exact path is taken (P5-4b)\n",
-                     (double) g_alspec.tau, (double) g_alspec.tau_total, g_alspec.block, g_alspec.verify_stride);
+                     "IK2_ALSPEC: gated attention on - tau %g, tau_total %g, block %d keys, probe 1 key in %d, verify "
+                     "1/%d; global visits only, the exact path on the sample\n",
+                     (double) g_alspec.tau, (double) g_alspec.tau_total, g_alspec.block, g_alspec_probe,
+                     g_alspec.verify_stride);
     g_mv = !getenv("IK2_MV") || std::atoi(getenv("IK2_MV"));
     g_group = !getenv("IK2_GROUP") || std::atoi(getenv("IK2_GROUP"));
     if (getenv("IK2_GROUP")) {
@@ -4980,6 +5041,16 @@ int main(int argc, char** argv) {
         Vi.h_v = dalloc<float>(3 * KD);
         Vi.h_attn = dalloc<float>(3 * C);
         Vi.h_mlp = dalloc<float>(3 * C);
+        if (g_alspec.enabled && !Ly.sliding) {   // (IK2_ALSPEC: a global visit's per-block gate; sliding visits never gate)
+            Vi.alspec_nblocks = (ctx + 127) / 128;
+            Vi.alspec_visit = v;
+            Vi.alspec_est = dalloc<float2>(Vi.alspec_nblocks);
+            Vi.alspec_exact = dalloc<float2>(Vi.alspec_nblocks);
+            Vi.alspec_mask = dalloc<uint8_t>(Vi.alspec_nblocks);
+            Vi.alspec_cnt = dalloc<int>(8);
+            CU(cudaMemsetAsync(Vi.alspec_mask, 0, (size_t) Vi.alspec_nblocks, g_s));
+            CU(cudaMemsetAsync(Vi.alspec_cnt, 0, 8 * sizeof(int), g_s));
+        }
     }
     c.n_rows = (int) (S.info("output.weight")->elements() / C);
     M.out_w = load_mat(S, "output.weight", c.n_rows, (int) C);
@@ -6362,6 +6433,7 @@ int main(int argc, char** argv) {
         std::printf("generation: %d tokens in %.2f s (%.2f tok/s); cache %llu hits, %llu misses in it\n",
                     (int) out.size() - 1, gen_s, (out.size() - 1) / gen_s, (unsigned long long) (ec_sum([](ExpertCache& e) { return e.hits; }) - h0),
                     (unsigned long long) (ec_sum([](ExpertCache& e) { return e.misses; }) - m0));
+    alspec_report(M);
     std::printf("generated:");
     for (int t : out) std::printf(" %d", t);
     std::printf("\n");
