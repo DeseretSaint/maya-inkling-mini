@@ -4609,6 +4609,35 @@ static int kld_report(const KldRef& ref, const std::vector<float>& cand, const s
     return 0;
 }
 
+// A2 — repetition-loop detector, ported from Strata's ink_serve.h:138-149 with its thresholds verbatim:
+// nothing before 64 generated tokens, periods 1..32, 16 repeats needed for period <= 4 and 6 for longer.
+// Strata tests its own generated-id list (rq.gen_ids); here the generated tail is the end of `ids`, so the
+// caller says how many tokens it has generated and only that tail is examined. Exact-period repetition
+// only, as theirs is. Returns the repeating period, 0 when there is no loop.
+int detect_repetition_loop(const std::vector<int>& ids, int n_gen) {
+    if (n_gen < 64) return 0;
+    const int n = std::min(n_gen, (int) ids.size());
+    for (int period = 1; period <= 32; ++period) {
+        const int reps = (period <= 4) ? 16 : 6;
+        const int span = period * reps;          // the tokens the window must hold
+        if (n < span) continue;
+        const int last = (int) ids.size() - 1;
+        bool loop = true;
+        for (int k = 0; k < span - period && loop; ++k)   // each token against the same place one period back
+            if (ids[last - k] != ids[last - k - period]) loop = false;
+        if (loop) return period;
+    }
+    return 0;
+}
+
+// The anti-loop reason line: names the period and the tokens that repeat, and says how much was generated.
+void report_repetition_loop(FILE* to, const std::vector<int>& ids, int period, int n_gen, int max_new) {
+    std::fprintf(to, "anti-loop: period %d, repeating token%s", period, period == 1 ? "" : "s");
+    for (int k = period; k >= 1; --k) std::fprintf(to, " %d", ids[ids.size() - k]);
+    std::fprintf(to, "; stopped after %d of %d generated tokens\n", n_gen, max_new);
+    std::fflush(to);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -6104,6 +6133,8 @@ int main(int argc, char** argv) {
             const bool use_cand = !(getenv("IK2_CAND") && !std::atoi(getenv("IK2_CAND")));
             bool cand = false;   // the last token's logits came as candidates (g_cand), not in `last`
             const char* reason = "length";
+            // A2 anti-loop: on by default, IK2_ANTI_LOOP=0 turns it off
+            const bool anti_loop = !(getenv("IK2_ANTI_LOOP") && !std::atoi(getenv("IK2_ANTI_LOOP")));
             int n_out = 0;
             int greedy_tok = temp <= 0 && !last.empty() ? pick(last.data()) : -1;
             int pending_sample = -1;
@@ -6119,6 +6150,16 @@ int main(int argc, char** argv) {
                 if (g_cancel) {
                     reason = "cancelled";
                     break;
+                }
+                // A2: tested here, on the tokens the previous step appended to `hist` (plain, suffix and
+                // speculative alike all land there before the next iteration), never on the prompt.
+                if (anti_loop && i > 0) {
+                    const int period = detect_repetition_loop(hist, n_out);
+                    if (period) {
+                        report_repetition_loop(stderr, hist, period, n_out, max_new);
+                        reason = "anti-loop";
+                        break;
+                    }
                 }
                 const int tok = temp <= 0             ? greedy_tok
                                 : pending_sample >= 0 ? pending_sample
@@ -6332,6 +6373,9 @@ int main(int argc, char** argv) {
     const uint64_t h0 = (uint64_t) ec_sum([](ExpertCache& e) { return e.hits; }),
                    m0 = (uint64_t) ec_sum([](ExpertCache& e) { return e.misses; });
     int n_steps = 0;
+    // A2 anti-loop: on by default, IK2_ANTI_LOOP=0 turns it off
+    const bool anti_loop = !(getenv("IK2_ANTI_LOOP") && !std::atoi(getenv("IK2_ANTI_LOOP")));
+    bool anti_loop_stop = false;
     const int verify_check = getenv("IK2_VERIFY_CHECK") ? std::atoi(getenv("IK2_VERIFY_CHECK")) : 0;
     const int block_check = getenv("IK2_BLOCK_CHECK") ? std::atoi(getenv("IK2_BLOCK_CHECK")) : 0;
     double t_draft = 0, t_verify = 0;
@@ -6361,6 +6405,16 @@ int main(int argc, char** argv) {
         if (g_managed_experts && i >= next_placement) {
             place_decode(M, (int)prompt.size() + i);
             next_placement = i + kPlacementInterval;
+        }
+        // A2: tested on `out` here, i.e. on every token the previous step appended (the suffix branch
+        // appends several at once), so the prompt is never part of the window.
+        if (anti_loop && i > 0) {
+            const int period = detect_repetition_loop(out, (int) out.size());
+            if (period) {
+                report_repetition_loop(stdout, out, period, (int) out.size(), gen);
+                anti_loop_stop = true;
+                break;
+            }
         }
         const int tok = i < (int) force.size() ? force[i] : best;
         if (i < (int) force.size()) agree += best == force[i];
@@ -6600,5 +6654,5 @@ int main(int argc, char** argv) {
     std::fflush(stdout);
     if (g_trace) std::fclose(g_trace);
     pop_dump();
-    return 0;
+    return anti_loop_stop ? 3 : 0;   // 3: ended by the anti-loop detector, not by length or a stop token
 }
