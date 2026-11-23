@@ -350,14 +350,78 @@ __device__ __forceinline__ void store_v_warp(const float* vp, uint8_t* vdst, int
     rms_fp8_warp(vp, vdst, D, eps, v_scale);
 }
 
+// ---- V-only 4-bit (IK2_KV=v4, the k8v4 shape): K stays E4M3; V is Hadamard-rotated and rounded to a per-row
+// symmetric int4 ([-7, 7]) - 64 bytes and one FP16 scale a row of 128 values.  The rotation is orthonormal, so the
+// weighted sum attention forms is the same sum of rotated values: every kernel below stores rotated V, loads it as
+// rotated values, and rotates the output once (the sum and the de-rotation commute), never the keys it reads.
+constexpr float kV4InvSqrtD = 0.08838834764831845f;   // 1 / sqrt(128)
+
+// The 128 dims of a row as 32 lanes x float4 (dims 4 l .. 4 l + 3 in lane l): seven butterflies, the first two in
+// the lane's own registers, the last five between lanes at a shuffle distance of st / 4.  Its own inverse (H is
+// symmetric and H H = I at this scale), so the store and the output call it the same way.
+__device__ __forceinline__ void hada128_f4(float4& x, int lane) {
+    float a = x.x, b = x.y, c = x.z, d = x.w;
+    x.x = a + b, x.y = a - b, x.z = c + d, x.w = c - d;             // dim bit 0
+    a = x.x, b = x.y, c = x.z, d = x.w;
+    x.x = a + c, x.z = a - c, x.y = b + d, x.w = b - d;             // dim bit 1
+    for (int st = 4; st <= 64; st <<= 1) {                          // dim bits 2 .. 6 = lane bits 0 .. 4
+        const int ld = st >> 2;
+        const float4 y = make_float4(__shfl_xor_sync(0xffffffffu, x.x, ld), __shfl_xor_sync(0xffffffffu, x.y, ld),
+                                     __shfl_xor_sync(0xffffffffu, x.z, ld), __shfl_xor_sync(0xffffffffu, x.w, ld));
+        if ((lane & ld) == 0) {
+            x.x += y.x, x.y += y.y, x.z += y.z, x.w += y.w;
+        } else {
+            x.x = y.x - x.x, x.y = y.y - x.y, x.z = y.z - x.z, x.w = y.w - x.w;
+        }
+    }
+    x.x *= kV4InvSqrtD, x.y *= kV4InvSqrtD, x.z *= kV4InvSqrtD, x.w *= kV4InvSqrtD;
+}
+
+// 4 packed nibbles (dims 4 l .. 4 l + 3 of a row) at a lane's scale.  Two's complement: 8 .. 15 are -8 .. -1.
+__device__ __forceinline__ float4 v4_load4(const uint8_t* vr, int lane, float scale) {
+    const uint32_t p = __ldg((const uint32_t*) ((const uint8_t*) vr + 2 * lane)) & 0xFFFFu;
+    const int n0 = (int) (p & 0xFu), n1 = (int) ((p >> 4) & 0xFu), n2 = (int) ((p >> 8) & 0xFu),
+              n3 = (int) ((p >> 12) & 0xFu);
+    return make_float4((n0 & 8 ? n0 - 16 : n0) * scale, (n1 & 8 ? n1 - 16 : n1) * scale,
+                       (n2 & 8 ? n2 - 16 : n2) * scale, (n3 & 8 ? n3 - 16 : n3) * scale);
+}
+__device__ __forceinline__ float2 v4n2(uint8_t b, float scale) {   // two nibbles of a byte
+    const int n0 = b & 0xF, n1 = (b >> 4) & 0xF;
+    return make_float2((n0 & 8 ? n0 - 16 : n0) * scale, (n1 & 8 ? n1 - 16 : n1) * scale);
+}
+
+// V4 store: RMS-normalise (as the FP8 path does), rotate, then round to a per-row absmax int4 and pack 4 nibbles a
+// lane into 2 bytes; lane 0 writes the row's FP16 scale.  srow is this (slot, KV head)'s scale in the [ctx][KV] array.
+__device__ __forceinline__ void store_v4_warp(const float* vp, uint8_t* vdst, uint16_t* srow, int D, float eps) {
+    const int lane = threadIdx.x & 31;
+    float4 x;
+    if (D == 128 && (((uintptr_t) vp & 15) == 0)) {
+        x = ((const float4*) vp)[lane];
+    } else {
+        x = make_float4(vp[4 * lane], vp[(4 * lane + 1) % D], vp[(4 * lane + 2) % D], vp[(4 * lane + 3) % D]);
+    }
+    const float rms = rsqrtf(wsum(x.x * x.x + x.y * x.y + x.z * x.z + x.w * x.w) / (float) D + eps);
+    x.x *= rms, x.y *= rms, x.z *= rms, x.w *= rms;
+    hada128_f4(x, lane);
+    float m = fmaxf(fmaxf(fabsf(x.x), fabsf(x.y)), fmaxf(fabsf(x.z), fabsf(x.w)));
+    m = wmax(m);
+    const float s = m > 0.0f ? m / 7.0f : 1.0f;
+    auto qz = [&](float v) {
+        const int q = (int) lrintf(fminf(7.0f, fmaxf(-7.0f, v / s)));
+        return (uint32_t) (q & 0xF);
+    };
+    ((uint16_t*) vdst)[lane] = (uint16_t) (qz(x.x) | (qz(x.y) << 4) | (qz(x.z) << 8) | (qz(x.w) << 12));
+    if (lane == 0) srow[0] = f2h(s);
+}
+
 // 1 warp (32 threads) per group across all q, k, v, r groups of T tokens
-template <class KV>
+template <class KV, bool V4 = false>
 __global__ void prep_qkv_r_impl_kernel(float* q, const float* q_clip, const float* k_in, KV* kc, const float* v_in,
-                                       KV* vc, float* r, const float* r_clip, int T, int H, int KVh, int D, int d_rel,
-                                       float qk_clip, float rel_clip, float eps, const int* pos, float alpha,
-                                       float n_floor, int pos0, int kv_cap, float k_scale, float v_scale,
-                                       const int* pos0_d, uint16_t* q16, const uint16_t* sink_w, const float* sink_x,
-                                       int sink_k, float* sink_y, int q_ld = 0, int r_ld = 0) {
+                                       KV* vc, uint16_t* vs4, float* r, const float* r_clip, int T, int H, int KVh,
+                                       int D, int d_rel, float qk_clip, float rel_clip, float eps, const int* pos,
+                                       float alpha, float n_floor, int pos0, int kv_cap, float k_scale,
+                                       float v_scale, const int* pos0_d, uint16_t* q16, const uint16_t* sink_w,
+                                       const float* sink_x, int sink_k, float* sink_y, int q_ld = 0, int r_ld = 0) {
     if (pos0_d) pos0 = *pos0_d;   // (a token of a replayed graph: its position read here)
     const int gid = blockIdx.x;
     const int per_tok = 2 * H + 2 * KVh;
@@ -393,8 +457,13 @@ __global__ void prep_qkv_r_impl_kernel(float* q, const float* q_clip, const floa
         const int kv = rem - H - KVh;
         const int slot = kv_cap > 0 ? (pos0 + t) % kv_cap : (pos0 + t);
         const float* vp = v_in + ((size_t) t * KVh + kv) * D;
-        KV* vdst = vc + ((size_t) slot * KVh + kv) * D;
-        store_v_warp(vp, vdst, D, eps, v_scale);
+        if constexpr (V4) {
+            uint8_t* vdst = (uint8_t*) vc + ((size_t) slot * KVh + kv) * (D / 2);
+            store_v4_warp(vp, vdst, vs4 + (size_t) slot * KVh + kv, D, eps);
+        } else {
+            KV* vdst = vc + ((size_t) slot * KVh + kv) * D;
+            store_v_warp(vp, vdst, D, eps, v_scale);
+        }
     } else {
         const int h = rem - H - 2 * KVh;
         float* rp = r + (size_t) t * r_ld + (size_t) h * d_rel;
@@ -1233,28 +1302,6 @@ __device__ __forceinline__ void fa_tile_from_raw(uint16_t* Ks, uint16_t* Vs, con
         *(uint4*) (Vs + row * kFaLd + col) = e4m3x8_h8(v8);
     }
 }
-#if defined(__HIP_PLATFORM_AMD__)
-// A workgroup has 64 KB of shared memory on gfx12: an FP8 tile has no room for its staged bytes as well, so
-// they are turned into FP16 as they are loaded.  The same 8 bytes an iteration as fa_tile_from_raw reads, and
-// the same conversion, so the tile is exactly the one the CUDA path builds.
-template <int NT>
-__device__ __forceinline__ void fa_load_tile_raw_f16(uint16_t* Ks, uint16_t* Vs, const uint8_t* kc,
-                                                     const uint8_t* vc, int kv_cap, int KD, int g, int kt,
-                                                     int k_end, int tid) {
-#pragma unroll
-    for (int it = 0; it < (kFaBN * kFaD / 8) / NT; ++it) {
-        const int c = it * NT + tid, row = c >> 4, col = (c & 15) * 8;
-        const int kp = kt + row;
-        const bool ok = kp < k_end;
-        const int pr = ok ? (kv_cap > 0 ? kp % kv_cap : kp) : 0;
-        const size_t off = (size_t) pr * KD + (size_t) g * kFaD + col;
-        const uint2 k8 = ok ? *(const uint2*) (kc + off) : make_uint2(0u, 0u);
-        const uint2 v8 = ok ? *(const uint2*) (vc + off) : make_uint2(0u, 0u);
-        *(uint4*) (Ks + row * kFaLd + col) = e4m3x8_h8(k8);
-        *(uint4*) (Vs + row * kFaLd + col) = e4m3x8_h8(v8);
-    }
-}
-#endif
 
 // The relative bias: a tile within the extent of a warp's queries has the warp copy its 16 rows x 64 distances of the
 // table into shared memory (cp.async, coalesced, issued before the tile's Q K^T) - loading it element by element at
@@ -1365,12 +1412,74 @@ __device__ __forceinline__ void fa_load_tile_wg(uint16_t* Ks, uint16_t* Vs, cons
     }
 }
 
-template <int NW, bool WG, class KVT = uint16_t, bool FAW = true>   // (KVT: the cache's values, FP16 or FP8 - an
-__global__ void __launch_bounds__(NW * 32, 2)        //  FP8 tile's bytes are made FP16 in shared memory; the
-                                                     //  warpgroup path is FP16's; FAW: IK2_FA_WMMA, the QK^T and
-                                                     //  PV products on the gfx12 matrix core or emulated)
+// ... from an FP8 (E4M3) cache with a V-only 4-bit V (IK2_KV=v4): K's 8 bytes as above; V's 8 values are 4 packed
+// bytes of the row's rotated int4, scaled by that row's FP16 scale.  vc4's stride is a half (KD / 2), vs4's one
+// FP16 a (key, KV head).
+template <int NT, bool V4 = false>
+__device__ __forceinline__ void fa_load_tile_raw_f16(uint16_t* Ks, uint16_t* Vs, const uint8_t* kc, const uint8_t* vc,
+                                                     const uint8_t* vc4, const uint16_t* vs4, int kvd, int kv_cap,
+                                                     int KD, int g, int kt, int k_end, int tid) {
+#pragma unroll
+    for (int it = 0; it < (kFaBN * kFaD / 8) / NT; ++it) {
+        const int c = it * NT + tid, row = c >> 4, col = (c & 15) * 8;
+        const int kp = kt + row;
+        const bool ok = kp < k_end;
+        const int pr = ok ? (kv_cap > 0 ? kp % kv_cap : kp) : 0;
+        const size_t off = (size_t) pr * KD + (size_t) g * kFaD + col;
+        const uint2 k8 = ok ? *(const uint2*) (kc + off) : make_uint2(0u, 0u);
+        *(uint4*) (Ks + row * kFaLd + col) = e4m3x8_h8(k8);
+        if constexpr (V4) {
+            const size_t voff = (size_t) pr * (KD / 2) + (size_t) g * 64 + col / 2;
+            const uint32_t vp = ok ? *(const uint32_t*) (vc4 + voff) : 0u;
+            const float s = ok ? h2f(__ldg(vs4 + (size_t) pr * kvd + g)) : 0.0f;
+            const float2 a = v4n2((uint8_t) (vp & 0xFFu), s), b = v4n2((uint8_t) ((vp >> 8) & 0xFFu), s);
+            const float2 c2 = v4n2((uint8_t) ((vp >> 16) & 0xFFu), s), d2 = v4n2((uint8_t) ((vp >> 24) & 0xFFu), s);
+            *(uint4*) (Vs + row * kFaLd + col) = make_uint4(f2_to_u32(a.x, a.y), f2_to_u32(b.x, b.y),
+                                                           f2_to_u32(c2.x, c2.y), f2_to_u32(d2.x, d2.y));
+        } else {
+            const uint2 v8 = ok ? *(const uint2*) (vc + off) : make_uint2(0u, 0u);
+            *(uint4*) (Vs + row * kFaLd + col) = e4m3x8_h8(v8);
+        }
+    }
+}
+
+// The flash kernel's 128 output dims of a (query, head) as 4 lanes x 16 j's x 2: dim = 8 j + 2 tq + e.  The same seven
+// butterflies as hada128_f4, over that layout: e in the registers, tq between lanes xor 1 / xor 2, j in the registers.
+__device__ __forceinline__ void hada128_flash_rows(float o[16][4], int e0, int tq, int lane) {
+    for (int j = 0; j < 16; ++j) {
+        const float a = o[j][e0], b = o[j][e0 + 1];
+        o[j][e0] = a + b, o[j][e0 + 1] = a - b;                        // dim bit 0
+    }
+    for (int lb = 1; lb <= 2; lb <<= 1) {                              // dim bits 1, 2 = tq bits 0, 1
+        const bool up = (tq & lb) == 0;
+        for (int j = 0; j < 16; ++j) {
+            const float y0 = __shfl_xor_sync(0xffffffffu, o[j][e0], lb);
+            const float y1 = __shfl_xor_sync(0xffffffffu, o[j][e0 + 1], lb);
+            if (up) {
+                o[j][e0] += y0, o[j][e0 + 1] += y1;
+            } else {
+                o[j][e0] = y0 - o[j][e0], o[j][e0 + 1] = y1 - o[j][e0 + 1];
+            }
+        }
+    }
+    for (int jb = 1; jb < 16; jb <<= 1)                                // dim bits 3 .. 6 = j bits 0 .. 3
+        for (int j = 0; j < 16; ++j)
+            if ((j & jb) == 0) {
+                const float a0 = o[j][e0], a1 = o[j][e0 + 1], b0 = o[j + jb][e0], b1 = o[j + jb][e0 + 1];
+                o[j][e0] = a0 + b0, o[j][e0 + 1] = a1 + b1;
+                o[j + jb][e0] = a0 - b0, o[j + jb][e0 + 1] = a1 - b1;
+            }
+    for (int j = 0; j < 16; ++j) o[j][e0] *= kV4InvSqrtD, o[j][e0 + 1] *= kV4InvSqrtD;
+}
+
+template <int NW, bool WG, class KVT = uint16_t, bool FAW = true, bool V4 = false>   // (KVT: the cache's values,
+__global__ void __launch_bounds__(NW * 32, 2)        //  FP16 or FP8 - an FP8 tile's bytes are made FP16 in shared
+                                                     //  memory; the warpgroup path is FP16's; FAW: IK2_FA_WMMA, the
+                                                     //  QK^T and PV products on the gfx12 matrix core or emulated;
+                                                     //  V4: a V-only 4-bit V cache beside the FP8 K)
 attn_flash_f16_kernel(const uint16_t* __restrict__ q16, int q_ld, const KVT* __restrict__ kc,
-                      const KVT* __restrict__ vc, int kv_cap, int H, int KV, int Tq, int qpos0, float qk_scale,
+                      const KVT* __restrict__ vc, const uint8_t* __restrict__ vc4,
+                      const uint16_t* __restrict__ vs4, int kv_cap, int H, int KV, int Tq, int qpos0, float qk_scale,
                       const float* __restrict__ bias, int extent, int window, int n_split, float* __restrict__ o_part,
                       float2* __restrict__ ml_part) {
     extern __shared__ __align__(16) uint16_t fa_sm[];
@@ -1496,7 +1605,8 @@ attn_flash_f16_kernel(const uint16_t* __restrict__ q16, int q_ld, const KVT* __r
         // (the tile, into the one buffer - after the barrier, so no warp is still reading the tile before's - and
         //  a barrier again, so it is every warp's.  kt, k_hi: this tile's keys, rows past k_end zero-filled.)
         if constexpr (WG) fa_load_tile_wg<NW * 32>(Ks, Vs, kc, vc, kv_cap, KD, g, kt, k_hi, tid);
-        else if constexpr (F8) fa_load_tile_raw_f16<NW * 32>(Ks, Vs, kc, vc, kv_cap, KD, g, kt, k_hi, tid);
+        else if constexpr (F8) fa_load_tile_raw_f16<NW * 32, V4>(Ks, Vs, kc, vc, vc4, vs4, KV, kv_cap, KD, g, kt, k_hi,
+                                                                tid);
         else fa_load_tile<NW * 32>(Ks, Vs, kc, vc, kv_cap, KD, g, kt, k_hi, tid);
         __syncthreads();
 #else
@@ -1653,6 +1763,10 @@ attn_flash_f16_kernel(const uint16_t* __restrict__ q16, int q_ld, const KVT* __r
         }
         if constexpr (!F8) __syncthreads();   // (the buffer is refilled next iteration; FP8's FP16 tile is written
     }                                         //  past the next iteration's barrier)
+    if constexpr (V4) {   // (the V row was rotated on store: the output's de-rotation, once, for both of the pair)
+        hada128_flash_rows(o, 0, tq, lane);
+        hada128_flash_rows(o, 2, tq, lane);
+    }
     la += __shfl_xor_sync(0xffffffffu, la, 1);
     la += __shfl_xor_sync(0xffffffffu, la, 2);
     lb += __shfl_xor_sync(0xffffffffu, lb, 1);
@@ -4083,11 +4197,12 @@ __device__ __forceinline__ float4 v_load4<uint8_t>(const uint8_t* vr, int lane) 
                        e4m3fn_to_f32(vr[o + 3]));
 }
 
-template <class KV>
+template <class KV, bool V4 = false>
 __device__ __forceinline__ void attn_flash_range(const float* qh, const float* rh, const KV* kc, const KV* vc,
-                                                 int KD, int g, int kv_cap, int k0, int j0, int j1, int qpos,
-                                                 float qk_scale, const float* proj, int d_rel, int extent, int window,
-                                                 float* sm_m, float* sm_s, float sm_o[][128]) {
+                                                 const uint8_t* vc4, const uint16_t* vs4, int KD, int g, int kv_cap,
+                                                 int k0, int j0, int j1, int qpos, float qk_scale, const float* proj,
+                                                 int d_rel, int extent, int window, float* sm_m, float* sm_s,
+                                                 float sm_o[][128]) {
     const int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
     const int o = lane * 4;
     const float4 q4 = (((uintptr_t) qh & 15) == 0) ? __ldg((const float4*) (qh + o))
@@ -4109,7 +4224,9 @@ __device__ __forceinline__ void attn_flash_range(const float* qh, const float* r
             l += wsum(b);
         }
         if (l > -INFINITY) {
-            const float4 v4 = v_load4(vc + head_off, lane);
+            const float4 v4 = V4 ? v4_load4(vc4 + (size_t) slot * (KD / 2) + (size_t) g * 64, lane,
+                                            h2f(__ldg(vs4 + (size_t) slot * (KD / 128) + g)))
+                                 : v_load4(vc + head_off, lane);
             const float m_new = fmaxf(m_w, l);
             const float alpha = (m_w == -INFINITY) ? 0.0f : expf(m_w - m_new);
             const float beta = expf(l - m_new);
@@ -4121,6 +4238,7 @@ __device__ __forceinline__ void attn_flash_range(const float* qh, const float* r
             o_w.w = o_w.w * alpha + v4.w * beta;
         }
     }
+    if constexpr (V4) hada128_f4(o_w, lane);   // (this row's de-rotation, once, on the output the warp formed)
     if (lane == 0) {
         sm_m[warp] = m_w;
         sm_s[warp] = s_w;
@@ -4130,10 +4248,11 @@ __device__ __forceinline__ void attn_flash_range(const float* qh, const float* r
 }
 
 // Unified split kernel for both attn_decode (gridDim.z = 1) and attn_multi (gridDim.z = nq).
-template <class KV>
-__global__ void attn_split_kernel(const float* q, const float* r, const KV* kc, const KV* vc, int kv_cap, int H,
-                                  int Hkv, int k0, int nk, int qpos0, float qk_scale, const float* proj, int d_rel,
-                                  int extent, int window, float* part, const int* pos_d) {
+template <class KV, bool V4 = false>
+__global__ void attn_split_kernel(const float* q, const float* r, const KV* kc, const KV* vc, const uint8_t* vc4,
+                                  const uint16_t* vs4, int kv_cap, int H, int Hkv, int k0, int nk, int qpos0,
+                                  float qk_scale, const float* proj, int d_rel, int extent, int window, float* part,
+                                  const int* pos_d) {
     if (pos_d) {   // (tokens of a replayed graph: the first's position read here, the keys they may see from it)
         qpos0 = *pos_d;
         k0 = window < (1 << 30) ? max(0, qpos0 - window + 1) : 0;
@@ -4146,8 +4265,8 @@ __global__ void attn_split_kernel(const float* q, const float* r, const KV* kc, 
     const int len = (nk + P - 1) / P, j0 = p * len, j1 = min(nk, j0 + len);
     const float* qh = q + ((size_t) qi * H + h) * 128;
     const float* rh = r + ((size_t) qi * H + h) * d_rel;
-    attn_flash_range(qh, rh, kc, vc, KD, g, kv_cap, k0, j0, j1, qpos, qk_scale, proj, d_rel, extent, window, sm_m,
-                     sm_s, sm_o);
+    attn_flash_range<KV, V4>(qh, rh, kc, vc, vc4, vs4, KD, g, kv_cap, k0, j0, j1, qpos, qk_scale, proj, d_rel, extent,
+                             window, sm_m, sm_s, sm_o);
     const float M = fmaxf(fmaxf(sm_m[0], sm_m[1]), fmaxf(sm_m[2], sm_m[3]));
     float sum = 0.0f, o = 0.0f;
     if (M > -INFINITY) {
@@ -4196,18 +4315,19 @@ __global__ void mv_blocks_kernel(int type, const uint8_t* W, int N, int K, size_
 }
 
 // one block a head, 4 warps: register Flash-Decode online softmax per warp, 1 SMEM combine
-template <class KV>
+template <class KV, bool V4 = false>
 __global__ void attn_decode_kernel(const float* q, const float* r, const float* sink, const KV* kc, const KV* vc,
-                                   int kv_cap, int H, int Hkv, int k0, int nk, int qpos, float qk_scale,
-                                   float v_inv_scale, const float* proj, int d_rel, int extent, int window, float* out) {
+                                   const uint8_t* vc4, const uint16_t* vs4, int kv_cap, int H, int Hkv, int k0, int nk,
+                                   int qpos, float qk_scale, float v_inv_scale, const float* proj, int d_rel,
+                                   int extent, int window, float* out) {
     __shared__ float sm_m[4], sm_s[4];
     __shared__ __align__(16) float sm_o[4][128];
     const int h = blockIdx.x, g = h / (H / Hkv), tid = threadIdx.x;
     const int KD = Hkv * 128;
     const float* qh = q + (size_t) h * 128;
     const float* rh = r + (size_t) h * d_rel;
-    attn_flash_range(qh, rh, kc, vc, KD, g, kv_cap, k0, 0, nk, qpos, qk_scale, proj, d_rel, extent, window, sm_m, sm_s,
-                     sm_o);
+    attn_flash_range<KV, V4>(qh, rh, kc, vc, vc4, vs4, KD, g, kv_cap, k0, 0, nk, qpos, qk_scale, proj, d_rel, extent,
+                             window, sm_m, sm_s, sm_o);
     const float sk = sink[h];
     const float M = fmaxf(sk, fmaxf(fmaxf(sm_m[0], sm_m[1]), fmaxf(sm_m[2], sm_m[3])));
     float den = expf(sk - M), o = 0.0f;
@@ -5798,19 +5918,20 @@ bool fa_wmma() {
     }();
     return on;
 }
-template <int NW, bool WG, class KVT>
-void attn_flash_launch(const uint16_t* q16, int q_ld, const KVT* kc, const KVT* vc, int kv_cap, int H, int KV,
-                       int Tq, int qpos0, float qk_scale, const float* bias, int extent, int window, int n_split,
-                       float* o_part, float2* ml_part, cudaStream_t s) {
+template <int NW, bool WG, class KVT, bool V4 = false>
+void attn_flash_launch(const uint16_t* q16, int q_ld, const KVT* kc, const KVT* vc, const uint8_t* vc4,
+                       const uint16_t* vs4, int kv_cap, int H, int KV, int Tq, int qpos0, float qk_scale,
+                       const float* bias, int extent, int window, int n_split, float* o_part, float2* ml_part,
+                       cudaStream_t s) {
     static bool attr[16] = {};   // (per device: the attribute is a device's, and the layer split runs on several)
     int dev = 0;
     cudaGetDevice(&dev);
     if (dev < 16 && !attr[dev]) {
 #if !defined(__HIP_PLATFORM_AMD__)
         // (gfx12: kFaSmem is under the 64 KB a workgroup gets by default, and HIP's opt-in rejects it)
-        cudaFuncSetAttribute(attn_flash_f16_kernel<NW, WG, KVT, true>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        cudaFuncSetAttribute(attn_flash_f16_kernel<NW, WG, KVT, true, V4>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              kFaSmem);
-        cudaFuncSetAttribute(attn_flash_f16_kernel<NW, WG, KVT, false>, cudaFuncAttributeMaxDynamicSharedMemorySize,
+        cudaFuncSetAttribute(attn_flash_f16_kernel<NW, WG, KVT, false, V4>, cudaFuncAttributeMaxDynamicSharedMemorySize,
                              kFaSmem);
         check("attn_flash (shared memory)");
 #endif
@@ -5818,13 +5939,13 @@ void attn_flash_launch(const uint16_t* q16, int q_ld, const KVT* kc, const KVT* 
     }
     const dim3 grid((unsigned) ((Tq + 16 * NW - 1) / (16 * NW)), (unsigned) H, (unsigned) n_split);
     if (fa_wmma())
-        attn_flash_f16_kernel<NW, WG, KVT, true><<<grid, NW * 32, kFaSmem, s>>>(q16, q_ld, kc, vc, kv_cap, H, KV, Tq,
-                                                                              qpos0, qk_scale, bias, extent, window,
-                                                                              n_split, o_part, ml_part);
+        attn_flash_f16_kernel<NW, WG, KVT, true, V4><<<grid, NW * 32, kFaSmem, s>>>(
+            q16, q_ld, kc, vc, vc4, vs4, kv_cap, H, KV, Tq, qpos0, qk_scale, bias, extent, window, n_split, o_part,
+            ml_part);
     else
-        attn_flash_f16_kernel<NW, WG, KVT, false><<<grid, NW * 32, kFaSmem, s>>>(q16, q_ld, kc, vc, kv_cap, H, KV, Tq,
-                                                                               qpos0, qk_scale, bias, extent, window,
-                                                                               n_split, o_part, ml_part);
+        attn_flash_f16_kernel<NW, WG, KVT, false, V4><<<grid, NW * 32, kFaSmem, s>>>(
+            q16, q_ld, kc, vc, vc4, vs4, kv_cap, H, KV, Tq, qpos0, qk_scale, bias, extent, window, n_split, o_part,
+            ml_part);
     check("attn_flash");
 }
 void attn_flash_f16(const uint16_t* q16, int q_ld, const uint16_t* kc, const uint16_t* vc, int kv_cap, int H, int KV,
@@ -5841,10 +5962,10 @@ void attn_flash_f16(const uint16_t* q16, int q_ld, const uint16_t* kc, const uin
     float* o_part = scratch;
     float2* ml_part = (float2*) (scratch + (size_t) n_split * Tq * H * kFaD);
     if (fa_wgmma())
-        attn_flash_launch<kFaNW, true, uint16_t>(q16, q_ld, kc, vc, kv_cap, H, KV, Tq, qpos0, qk_scale, bias, extent,
+        attn_flash_launch<kFaNW, true, uint16_t>(q16, q_ld, kc, vc, nullptr, nullptr, kv_cap, H, KV, Tq, qpos0, qk_scale, bias, extent,
                                                  window, n_split, o_part, ml_part, s);
     else
-        attn_flash_launch<kFaNW, false, uint16_t>(q16, q_ld, kc, vc, kv_cap, H, KV, Tq, qpos0, qk_scale, bias, extent,
+        attn_flash_launch<kFaNW, false, uint16_t>(q16, q_ld, kc, vc, nullptr, nullptr, kv_cap, H, KV, Tq, qpos0, qk_scale, bias, extent,
                                                   window, n_split, o_part, ml_part, s);
     attn_flash_combine_kernel<<<dim3((unsigned) Tq, (unsigned) H), kFaD, 0, s>>>(o_part, ml_part, n_split, Tq, H, sink,
                                                                                  out, o_ld, 1.0f);
@@ -5863,11 +5984,33 @@ void attn_flash_fp8(const uint16_t* q16, int q_ld, const uint8_t* kc, const uint
     n_split = std::max(1, std::min<int>(n_split, (int) (scratch_floats / per_split)));
     float* o_part = scratch;
     float2* ml_part = (float2*) (scratch + (size_t) n_split * Tq * H * kFaD);
-    attn_flash_launch<kFaNW, false, uint8_t>(q16, q_ld, kc, vc, kv_cap, H, KV, Tq, qpos0, qk_scale, bias, extent, window,
-                                             n_split, o_part, ml_part, s);
+    attn_flash_launch<kFaNW, false, uint8_t>(q16, q_ld, kc, vc, nullptr, nullptr, kv_cap, H, KV, Tq, qpos0, qk_scale,
+                                             bias, extent, window, n_split, o_part, ml_part, s);
     attn_flash_combine_kernel<<<dim3((unsigned) Tq, (unsigned) H), kFaD, 0, s>>>(o_part, ml_part, n_split, Tq, H, sink,
                                                                                  out, o_ld, v_inv_scale);
     check("attn_flash_combine");
+}
+
+// IK2_KV=v4's prefill flash attention: K from the E4M3 cache, V from the packed 4-bit one.  The tile loader expands a
+// row's 4 bytes at its scale, and the kernel de-rotates the output it forms (v_inv is 1: the scale is per row).
+void attn_flash_fp8_v4(const uint16_t* q16, int q_ld, const uint8_t* kc, const uint8_t* vc4, const uint16_t* vs4,
+                       int kv_cap, int H, int KV, int D, int Tq, int qpos0, float qk_scale, const float* bias,
+                       int extent, int window, const float* sink, float* out, int o_ld, float* scratch,
+                       size_t scratch_floats, int n_split, cudaStream_t s) {
+    if (Tq <= 0) return;
+    if (D != kFaD) {
+        std::fprintf(stderr, "ik2::k::attn_flash_fp8_v4: D = %d, not 128\n", D);
+        std::abort();
+    }
+    const size_t per_split = (size_t) Tq * H * (kFaD + 2);
+    n_split = std::max(1, std::min<int>(n_split, (int) (scratch_floats / per_split)));
+    float* o_part = scratch;
+    float2* ml_part = (float2*) (scratch + (size_t) n_split * Tq * H * kFaD);
+    attn_flash_launch<kFaNW, false, uint8_t, true>(q16, q_ld, kc, nullptr, vc4, vs4, kv_cap, H, KV, Tq, qpos0,
+                                                   qk_scale, bias, extent, window, n_split, o_part, ml_part, s);
+    attn_flash_combine_kernel<<<dim3((unsigned) Tq, (unsigned) H), kFaD, 0, s>>>(o_part, ml_part, n_split, Tq, H, sink,
+                                                                                 out, o_ld, 1.0f);
+    check("attn_flash_combine_v4");
 }
 int attn_flash_splits(int Tq, int H, int nk, int n_sm) {
     const int blocks = (Tq + 16 * kFaNW - 1) / (16 * kFaNW) * H;
@@ -6371,7 +6514,7 @@ void prep_qkv_r_f16(float* q, const float* q_clip, const float* k_in, uint16_t* 
     if (T <= 0) return;
     const int total = T * (2 * H + 2 * KV);
     prep_qkv_r_impl_kernel<uint16_t><<<(unsigned) total, 32, 0, s>>>(
-        q, q_clip, k_in, kc, v_in, vc, r, r_clip, T, H, KV, D, d_rel, qk_clip, rel_clip, eps, pos, alpha, n_floor,
+        q, q_clip, k_in, kc, v_in, vc, nullptr, r, r_clip, T, H, KV, D, d_rel, qk_clip, rel_clip, eps, pos, alpha, n_floor,
         pos0, kv_cap, 1.0f, 1.0f, nullptr, nullptr, nullptr, nullptr, 0, nullptr);
     check("prep_qkv_r_f16");
 }
@@ -6383,9 +6526,27 @@ void prep_qkv_r_fp8(float* q, const float* q_clip, const float* k_in, uint8_t* k
     if (T <= 0) return;
     const int total = T * (2 * H + 2 * KV);
     prep_qkv_r_impl_kernel<uint8_t><<<(unsigned) total, 32, 0, s>>>(
-        q, q_clip, k_in, kc, v_in, vc, r, r_clip, T, H, KV, D, d_rel, qk_clip, rel_clip, eps, pos, alpha, n_floor,
+        q, q_clip, k_in, kc, v_in, vc, nullptr, r, r_clip, T, H, KV, D, d_rel, qk_clip, rel_clip, eps, pos, alpha, n_floor,
         pos0, kv_cap, k_scale, v_scale, nullptr, nullptr, nullptr, nullptr, 0, nullptr);
     check("prep_qkv_r_fp8");
+}
+
+// IK2_KV=v4: K as prep_qkv_r_fp8 stores it, V rotated and packed to a per-row int4 (vc4 [ctx][KV][D / 2],
+// vs4 [ctx][KV] FP16 scales).  D = 128.
+void prep_qkv_r_fp8_v4(float* q, const float* q_clip, const float* k_in, uint8_t* kc, const float* v_in, uint8_t* vc4,
+                       uint16_t* vs4, float* r, const float* r_clip, int T, int H, int KV, int D, int d_rel,
+                       float qk_clip, float rel_clip, float eps, const int* pos, float alpha, float n_floor, int pos0,
+                       int kv_cap, float k_scale, cudaStream_t s) {
+    if (T <= 0) return;
+    if (D != 128) {
+        std::fprintf(stderr, "ik2::k::prep_qkv_r_fp8_v4: D = %d, not 128\n", D);
+        std::abort();
+    }
+    const int total = T * (2 * H + 2 * KV);
+    prep_qkv_r_impl_kernel<uint8_t, true><<<(unsigned) total, 32, 0, s>>>(
+        q, q_clip, k_in, kc, v_in, vc4, vs4, r, r_clip, T, H, KV, D, d_rel, qk_clip, rel_clip, eps, pos, alpha, n_floor,
+        pos0, kv_cap, k_scale, 1.0f, nullptr, nullptr, nullptr, nullptr, 0, nullptr);
+    check("prep_qkv_r_fp8_v4");
 }
 
 template <class KV>
@@ -6398,7 +6559,7 @@ void attn_multi_impl(const float* q, const float* r, const float* sink, const KV
     }
     const int P = std::min(128, std::max(1, (nk + 63) / 64));
     float* part = scratch;
-    attn_split_kernel<KV><<<dim3(H, P, nq), 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0, nk, qpos0, qk_scale, proj,
+    attn_split_kernel<KV><<<dim3(H, P, nq), 128, 0, s>>>(q, r, kc, vc, nullptr, nullptr, kv_cap, H, Hkv, k0, nk, qpos0, qk_scale, proj,
                                                           d_rel, extent, window, part, nullptr);
     check("attn_multi_split");
     attn_combine_kernel<<<dim3(H, nq), 128, 0, s>>>(sink, part, H, P, v_inv_scale, out);
@@ -6425,6 +6586,24 @@ void attn_multi_fp8(const float* q, const float* r, const float* sink, const uin
                     float* out, cudaStream_t s) {
     attn_multi_impl(q, r, sink, kc, vc, kv_cap, nq, H, Hkv, k0, nk, qpos0, qk_scale, v_inv_scale, proj, d_rel, extent,
                     window, scratch, out, s);
+}
+
+// IK2_KV=v4's attn_multi (2 .. 8 tokens' attention a head at a time, as attn_multi_fp8).
+void attn_multi_v4(const float* q, const float* r, const float* sink, const uint8_t* kc, const uint8_t* vc4,
+                   const uint16_t* vs4, int kv_cap, int nq, int H, int Hkv, int k0, int nk, int qpos0, float qk_scale,
+                   const float* proj, int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s) {
+    if (d_rel > 32) {
+        std::fprintf(stderr, "ik2::k::attn_multi_v4: d_rel %d\n", d_rel);
+        std::abort();
+    }
+    const int P = std::min(128, std::max(1, (nk + 63) / 64));
+    float* part = scratch;
+    attn_split_kernel<uint8_t, true><<<dim3(H, P, nq), 128, 0, s>>>(q, r, kc, nullptr, vc4, vs4, kv_cap, H, Hkv, k0,
+                                                                    nk, qpos0, qk_scale, proj, d_rel, extent, window,
+                                                                    part, nullptr);
+    check("attn_multi_split_v4");
+    attn_combine_kernel<<<dim3(H, nq), 128, 0, s>>>(sink, part, H, P, 1.0f, out);
+    check("attn_multi_combine_v4");
 }
 
 template <int WARPS, int ROWS>
@@ -6456,13 +6635,13 @@ void attn_decode_impl(const float* q, const float* r, const float* sink, const K
     // Flash-Decode splits over chunks of ~64 keys, up to 128 blocks per head (partials written directly to scratch)
     const int P = std::min(128, std::max(1, (nk + 63) / 64));
     if (P == 1) {
-        attn_decode_kernel<KV><<<H, 128, 0, s>>>(q, r, sink, kc, vc, kv_cap, H, Hkv, k0, nk, qpos, qk_scale,
+        attn_decode_kernel<KV><<<H, 128, 0, s>>>(q, r, sink, kc, vc, nullptr, nullptr, kv_cap, H, Hkv, k0, nk, qpos, qk_scale,
                                                    v_inv_scale, proj, d_rel, extent, window, out);
         check("attn_decode");
         return;
     }
     float* part = scratch;
-    attn_split_kernel<KV><<<dim3(H, P), 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, k0, nk, qpos, qk_scale, proj, d_rel,
+    attn_split_kernel<KV><<<dim3(H, P), 128, 0, s>>>(q, r, kc, vc, nullptr, nullptr, kv_cap, H, Hkv, k0, nk, qpos, qk_scale, proj, d_rel,
                                                       extent, window, part, nullptr);
     check("attn_decode_split");
     attn_combine_kernel<<<dim3(H, 1), 128, 0, s>>>(sink, part, H, P, v_inv_scale, out);
@@ -6489,6 +6668,32 @@ void attn_decode_fp8(const float* q, const float* r, const float* sink, const ui
                      float* out, cudaStream_t s) {
     attn_decode_impl(q, r, sink, kc, vc, kv_cap, H, Hkv, D, k0, nk, qpos, qk_scale, v_inv_scale, proj, d_rel, extent,
                      window, scratch, out, s);
+}
+
+// IK2_KV=v4: the same decode, K from the E4M3 cache, V from the packed 4-bit one (its row's FP16 scale applied on
+// the load; the warp's output de-rotated once inside attn_flash_range, so the combine's scaling is unchanged).
+void attn_decode_v4(const float* q, const float* r, const float* sink, const uint8_t* kc, const uint8_t* vc4,
+                    const uint16_t* vs4, int kv_cap, int H, int Hkv, int D, int k0, int nk, int qpos, float qk_scale,
+                    const float* proj, int d_rel, int extent, int window, float* scratch, float* out,
+                    cudaStream_t s) {
+    if (D != 128 || d_rel > 32) {
+        std::fprintf(stderr, "ik2::k::attn_decode_v4: D %d, d_rel %d\n", D, d_rel);
+        std::abort();
+    }
+    const int P = std::min(128, std::max(1, (nk + 63) / 64));
+    if (P == 1) {
+        attn_decode_kernel<uint8_t, true><<<H, 128, 0, s>>>(q, r, sink, kc, nullptr, vc4, vs4, kv_cap, H, Hkv, k0, nk,
+                                                            qpos, qk_scale, 1.0f, proj, d_rel, extent, window, out);
+        check("attn_decode_v4");
+        return;
+    }
+    float* part = scratch;
+    attn_split_kernel<uint8_t, true><<<dim3(H, P), 128, 0, s>>>(q, r, kc, nullptr, vc4, vs4, kv_cap, H, Hkv, k0, nk,
+                                                                qpos, qk_scale, proj, d_rel, extent, window, part,
+                                                                nullptr);
+    check("attn_decode_split_v4");
+    attn_combine_kernel<<<dim3(H, 1), 128, 0, s>>>(sink, part, H, P, 1.0f, out);
+    check("attn_decode_combine_v4");
 }
 
 void q8_tile(const int8_t* q, const uint16_t* d, int N, int K, const uint16_t* x, int T, float* y, int ldy,
@@ -6565,7 +6770,7 @@ void prep_qkv_r_f16_at(float* q, const float* q_clip, const float* k_in, uint16_
                        uint16_t* q16, cudaStream_t s, const uint16_t* sink_w, const float* sink_x, int sink_k,
                        float* sink_y) {
     prep_qkv_r_impl_kernel<uint16_t><<<(unsigned) (2 * H + 2 * KV + (sink_w ? H : 0)), 32, 0, s>>>(
-        q, q_clip, k_in, kc, v_in, vc, r, r_clip, 1, H, KV, D, d_rel, qk_clip, rel_clip, eps, log_scale ? pos : nullptr,
+        q, q_clip, k_in, kc, v_in, vc, nullptr, r, r_clip, 1, H, KV, D, d_rel, qk_clip, rel_clip, eps, log_scale ? pos : nullptr,
         alpha, n_floor, 0, kv_cap, 1.0f, 1.0f, pos, q16, sink_w, sink_x, sink_k, sink_y);
     check("prep_qkv_r_f16_at");
 }
@@ -6575,7 +6780,7 @@ void prep_qkv_r_fp8_at(float* q, const float* q_clip, const float* k_in, uint8_t
                        float k_scale, float v_scale, uint16_t* q16, cudaStream_t s, const uint16_t* sink_w,
                        const float* sink_x, int sink_k, float* sink_y) {
     prep_qkv_r_impl_kernel<uint8_t><<<(unsigned) (2 * H + 2 * KV + (sink_w ? H : 0)), 32, 0, s>>>(
-        q, q_clip, k_in, kc, v_in, vc, r, r_clip, 1, H, KV, D, d_rel, qk_clip, rel_clip, eps, log_scale ? pos : nullptr,
+        q, q_clip, k_in, kc, v_in, vc, nullptr, r, r_clip, 1, H, KV, D, d_rel, qk_clip, rel_clip, eps, log_scale ? pos : nullptr,
         alpha, n_floor, 0, kv_cap, k_scale, v_scale, pos, q16, sink_w, sink_x, sink_k, sink_y);
     check("prep_qkv_r_fp8_at");
 }
@@ -6583,7 +6788,7 @@ void prep_qkv_r_fp8_at(float* q, const float* q_clip, const float* k_in, uint8_t
 void attn_decode_f16_at(const float* q, const float* r, const float* sink, const uint16_t* kc, const uint16_t* vc,
                         int kv_cap, int H, int Hkv, const int* pos, int P, float qk_scale, const float* proj,
                         int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s) {
-    attn_split_kernel<uint16_t><<<dim3(H, P), 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, 0, 0, 0, qk_scale, proj,
+    attn_split_kernel<uint16_t><<<dim3(H, P), 128, 0, s>>>(q, r, kc, vc, nullptr, nullptr, kv_cap, H, Hkv, 0, 0, 0, qk_scale, proj,
                                                             d_rel, extent, window, scratch, pos);
     check("attn_decode_f16_at (split)");
     attn_combine_kernel<<<dim3(H, 1), 128, 0, s>>>(sink, scratch, H, P, 1.0f, out);
@@ -6593,7 +6798,7 @@ void attn_decode_fp8_at(const float* q, const float* r, const float* sink, const
                         int kv_cap, int H, int Hkv, const int* pos, int P, float qk_scale, float v_inv_scale,
                         const float* proj, int d_rel, int extent, int window, float* scratch, float* out,
                         cudaStream_t s) {
-    attn_split_kernel<uint8_t><<<dim3(H, P), 128, 0, s>>>(q, r, kc, vc, kv_cap, H, Hkv, 0, 0, 0, qk_scale, proj, d_rel,
+    attn_split_kernel<uint8_t><<<dim3(H, P), 128, 0, s>>>(q, r, kc, vc, nullptr, nullptr, kv_cap, H, Hkv, 0, 0, 0, qk_scale, proj, d_rel,
                                                            extent, window, scratch, pos);
     check("attn_decode_fp8_at (split)");
     attn_combine_kernel<<<dim3(H, 1), 128, 0, s>>>(sink, scratch, H, P, v_inv_scale, out);
@@ -6832,7 +7037,7 @@ void prep_qkv_r_fp8_block(float* q, int q_ld, const float* q_clip, const float* 
                           float n_floor, int kv_cap, float k_scale, float v_scale, uint16_t* q16, cudaStream_t s,
                           const uint16_t* sink_w, const float* sink_x, int sink_k, float* sink_y) {
     prep_qkv_r_impl_kernel<uint8_t><<<(unsigned) (T * (2 * H + 2 * KV) + (sink_w ? T * H : 0)), 32, 0, s>>>(
-        q, q_clip, k_in, kc, v_in, vc, r, r_clip, T, H, KV, D, d_rel, qk_clip, rel_clip, eps, log_scale ? pos : nullptr,
+        q, q_clip, k_in, kc, v_in, vc, nullptr, r, r_clip, T, H, KV, D, d_rel, qk_clip, rel_clip, eps, log_scale ? pos : nullptr,
         alpha, n_floor, 0, kv_cap, k_scale, v_scale, pos, q16, sink_w, sink_x, sink_k, sink_y, q_ld, r_ld);
     check("prep_qkv_r_fp8_block");
 }
@@ -6842,7 +7047,7 @@ void prep_qkv_r_f16_block(float* q, int q_ld, const float* q_clip, const float* 
                           float n_floor, int kv_cap, uint16_t* q16, cudaStream_t s, const uint16_t* sink_w,
                           const float* sink_x, int sink_k, float* sink_y) {
     prep_qkv_r_impl_kernel<uint16_t><<<(unsigned) (T * (2 * H + 2 * KV) + (sink_w ? T * H : 0)), 32, 0, s>>>(
-        q, q_clip, k_in, kc, v_in, vc, r, r_clip, T, H, KV, D, d_rel, qk_clip, rel_clip, eps, log_scale ? pos : nullptr,
+        q, q_clip, k_in, kc, v_in, vc, nullptr, r, r_clip, T, H, KV, D, d_rel, qk_clip, rel_clip, eps, log_scale ? pos : nullptr,
         alpha, n_floor, 0, kv_cap, 1.0f, 1.0f, pos, q16, sink_w, sink_x, sink_k, sink_y, q_ld, r_ld);
     check("prep_qkv_r_f16_block");
 }

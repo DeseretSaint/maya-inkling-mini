@@ -272,6 +272,25 @@ void unpack_kv_fp8_to_f16(const uint8_t* kc, const uint8_t* vc, int kv_cap, int 
                           float k_inv_scale, float v_inv_scale, uint16_t* k_out16, uint16_t* v_out16,
                           cudaStream_t s);
 
+/// V-only 4-bit (IK2_KV=v4, the k8v4 shape): K exactly as the FP8 path stores it (scaled E4M3), V rotated by a
+/// normalized Hadamard over the 128 dims and rounded to a per-row symmetric int4 ([-7, 7]).  vc4 is [kv_cap][KV][D/2]
+/// packed bytes, two nibbles a byte; vs4 the FP16 scale of each (row, KV head) [kv_cap][KV].  Every kernel here
+/// de-rotates the output it forms once (the weighted sum and the rotation commute), never the keys it reads.
+void prep_qkv_r_fp8_v4(float* q, const float* q_clip, const float* k_in, uint8_t* kc, const float* v_in, uint8_t* vc4,
+                       uint16_t* vs4, float* r, const float* r_clip, int T, int H, int KV, int D, int d_rel,
+                       float qk_clip, float rel_clip, float eps, const int* pos, float alpha, float n_floor, int pos0,
+                       int kv_cap, float k_scale, cudaStream_t s);
+void attn_decode_v4(const float* q, const float* r, const float* sink, const uint8_t* kc, const uint8_t* vc4,
+                    const uint16_t* vs4, int kv_cap, int H, int Hkv, int D, int k0, int nk, int qpos, float qk_scale,
+                    const float* proj, int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s);
+void attn_multi_v4(const float* q, const float* r, const float* sink, const uint8_t* kc, const uint8_t* vc4,
+                   const uint16_t* vs4, int kv_cap, int nq, int H, int Hkv, int k0, int nk, int qpos0, float qk_scale,
+                   const float* proj, int d_rel, int extent, int window, float* scratch, float* out, cudaStream_t s);
+void attn_flash_fp8_v4(const uint16_t* q16, int q_ld, const uint8_t* kc, const uint8_t* vc4, const uint16_t* vs4,
+                       int kv_cap, int H, int KV, int D, int Tq, int qpos0, float qk_scale, const float* bias,
+                       int extent, int window, const float* sink, float* out, int o_ld, float* scratch,
+                       size_t scratch_floats, int n_split, cudaStream_t s);
+
 // ---- the resident token path: every expert in VRAM (found on the device), the position read on the device, so a
 // token needs nothing from the host between its embedding and its logits and its launches replay as one CUDA graph
 

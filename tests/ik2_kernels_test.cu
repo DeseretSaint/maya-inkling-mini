@@ -911,6 +911,181 @@ void test_mv_blocks() {
     }
 }
 
+
+// The normalized Hadamard over 128 dims, as store_v4_warp applies it (the same transform de-rotates: H is symmetric
+// and orthonormal at this scale).  Host side, double, for the round-trip reference.
+float e4m3fn_to_f32_host(uint8_t q);   // (defined below, beside test_fp8_kv)
+
+void hada128_host(double* x) {
+    for (int st = 1; st < 128; st <<= 1)
+        for (int i = 0; i < 128; i += 2 * st)
+            for (int j = i; j < i + st; ++j) {
+                const double a = x[j], b = x[j + st];
+                x[j] = a + b, x[j + st] = a - b;
+            }
+    const double k = 1.0 / std::sqrt(128.0);
+    for (int d = 0; d < 128; ++d) x[d] *= k;
+}
+
+// IK2_KV=v4 (the k8v4 shape): the V round trip against the fp8 path on the same values, the packed bytes against a
+// host replica of the quantizer, and the decode output against the fp8 path's over the same keys.
+void test_kv4() {
+    // its own generator: the shared one's stream must not shift the tests after this one
+    std::mt19937 lrng(777001);
+    auto frand = [&](float a) { return std::uniform_real_distribution<float>(-a, a)(lrng); };
+    auto fvec = [&](size_t n, float a) {
+        std::vector<float> v(n);
+        for (auto& x : v) x = frand(a);
+        return v;
+    };
+    const int T = 130, H = 48, KV = 8, D = 128, d_rel = 16, k_scale = 16, v_scale = 32, eps = 1e-6f;   // (> 64 keys:
+    // the decode takes the split kernel + combine, the path a 261K decode runs)
+    const float k_inv = 1.0f / k_scale, v_inv = 1.0f / v_scale;
+    // the V values: a Gaussian core with a few fat outliers a row - the case the rotation is for
+    auto v_in = fvec((size_t) T * KV * D, 1.0f);
+    for (size_t r = 0; r < (size_t) T * KV; ++r)
+        for (int o = 0; o < 3; ++o) v_in[r * D + (int) ((r * 37 + o * 53) % D)] *= 9.0f;
+    auto k_in = fvec((size_t) T * KV * D, 4.0f), q = fvec((size_t) T * H * D, 0.02f), qc = fvec((size_t) H * D, 2.0f),
+         r_in = fvec((size_t) T * H * d_rel, 3.0f), rc = fvec((size_t) H * d_rel, 2.0f);
+    std::vector<int> pos(T);
+    for (int i = 0; i < T; ++i) pos[i] = i + 1;
+    float *dq = dev(q), *dqc = dev(qc), *dk = dev(k_in), *dv = dev(v_in), *dr = dev(r_in), *drc = dev(rc);
+    uint8_t* dkc = dev_n<uint8_t>((size_t) T * KV * D);     // K (E4M3), the same for both arms
+    uint8_t* dvc8 = dev_n<uint8_t>((size_t) T * KV * D);    // fp8 V
+    uint8_t* dvc4 = dev_n<uint8_t>((size_t) T * KV * D / 2); // packed int4 V
+    uint16_t* dvs4 = dev_n<uint16_t>((size_t) T * KV);
+    int* dpos = dev(pos);
+    const float qk_clip = 22.627416610717773f, rel_clip = 8.0f;
+    k::prep_qkv_r_fp8(dq, dqc, dk, dkc, dv, dvc8, dr, drc, T, H, KV, D, d_rel, qk_clip, rel_clip, eps, dpos, 0.0f,
+                      128000.0f, 0, 0, (float) k_scale, (float) v_scale, 0);
+    uint8_t* dkc2 = dev_n<uint8_t>((size_t) T * KV * D);
+    k::prep_qkv_r_fp8_v4(dq, dqc, dk, dkc2, dv, dvc4, dvs4, dr, drc, T, H, KV, D, d_rel, qk_clip, rel_clip, eps, dpos,
+                         0.0f, 128000.0f, 0, 0, (float) k_scale, 0);
+    const auto hk1 = host(dkc, (size_t) T * KV * D), hk2 = host(dkc2, (size_t) T * KV * D);
+    const auto hv8 = host(dvc8, (size_t) T * KV * D);
+    const auto hv4 = host(dvc4, (size_t) T * KV * D / 2);
+    const auto hs4 = host(dvs4, (size_t) T * KV);
+    bool k_same = std::memcmp(hk1.data(), hk2.data(), hk1.size()) == 0;
+    expect_true("kv4: K's bytes are the fp8 path's, bit for bit", k_same);
+
+    // the exact normalized row and both paths' dequantized ones, per (token, KV head)
+    double c8_max = 0, c4_max = 0, e8_ss = 0, e4_ss = 0, x_ss = 0, host_dev_max = 0, e4n_ss = 0;
+    for (int t = 0; t < 4; ++t)   // (four rows of the block, all KV heads each)
+        for (int kv = 0; kv < KV; ++kv) {
+            const size_t row = (size_t) t * KV + kv;
+            const float* vp = v_in.data() + row * D;
+            double sv = 0;
+            for (int d = 0; d < D; ++d) sv += (double) vp[d] * vp[d];
+            const double rs = 1.0 / std::sqrt(sv / D + eps);
+            std::vector<double> x(D), y8(D), y4(D);
+            for (int d = 0; d < D; ++d) x[d] = vp[d] * rs;
+            for (int d = 0; d < D; ++d) y8[d] = (double) e4m3fn_to_f32_host(hv8[row * D + d]) * v_inv;
+            const double s = (double) h2f_host(hs4[row]);
+            std::vector<double> rot(D);
+            for (int d = 0; d < D; ++d) {
+                const uint8_t b = hv4[row * D / 2 + d / 2];
+                const int nib = (d & 1) ? (b >> 4) & 0xF : b & 0xF;
+                rot[d] = (nib & 8 ? nib - 16 : nib) * s;
+            }
+            hada128_host(rot.data());   // (H H = I: the same transform de-rotates)
+            for (int d = 0; d < D; ++d) {
+                y4[d] = rot[d];
+                const double e8 = std::fabs(y8[d] - x[d]), e4 = std::fabs(y4[d] - x[d]);
+                c8_max = std::max(c8_max, e8), c4_max = std::max(c4_max, e4);
+                e8_ss += e8 * e8, e4_ss += e4 * e4, x_ss += x[d] * x[d];
+            }
+            // the same int4 without the rotation: the error the rotation has to earn its place against
+            {
+                double mn = 0;
+                for (int d = 0; d < D; ++d) mn = std::max(mn, std::fabs(x[d]));
+                const double sn = mn > 0 ? mn / 7.0 : 1.0;
+                for (int d = 0; d < D; ++d) {
+                    const double qd = std::nearbyint(std::min(7.0, std::max(-7.0, x[d] / sn))) * sn;
+                    e4n_ss += (qd - x[d]) * (qd - x[d]);
+                }
+            }
+            // the host replica of pack: normalize, rotate, absmax / 7, round to nearest even, clamp to [-7, 7]
+            std::vector<double> w(D);
+            for (int d = 0; d < D; ++d) w[d] = x[d];
+            hada128_host(w.data());
+            double m = 0;
+            for (int d = 0; d < D; ++d) m = std::max(m, std::fabs(w[d]));
+            const double sh = m > 0 ? m / 7.0 : 1.0;
+            for (int d = 0; d < D; ++d) {
+                const double qd = std::nearbyint(std::min(7.0, std::max(-7.0, w[d] / sh)));
+                const uint8_t b = hv4[row * D / 2 + d / 2];
+                const int nib = (d & 1) ? (b >> 4) & 0xF : b & 0xF;
+                const int want = (int) qd & 0xF;
+                host_dev_max = std::max(host_dev_max, (double) std::abs(nib - want));
+                if (std::abs(nib - want) != 0) {   // (a tie may round the other way: 1 is tolerated, 2 is not)
+                    host_dev_max = std::max(host_dev_max, 1.0);
+                }
+            }
+        }
+    const double n_rt = (double) (4 * KV * D);
+    const double x_rms = std::sqrt(x_ss / n_rt);
+    std::printf("kv4 round trip over %d rows of 128: exact row RMS %.4f; fp8 V max |err| %.5f (RMS %.5f); "
+                "v4 V max |err| %.5f (RMS %.5f)\n",
+                4 * KV, x_rms, c8_max, std::sqrt(e8_ss / n_rt), c4_max, std::sqrt(e4_ss / n_rt));
+    std::printf("kv4: the same int4 without the rotation: RMS err %.5f (%.0f%% worse than the rotated row's)\n",
+                std::sqrt(e4n_ss / n_rt), 100.0 * (std::sqrt(e4n_ss / e4_ss) - 1.0));
+    std::printf("kv4: the packed nibbles agree with the host quantizer (max |delta| %.0f of one level)\n", host_dev_max);
+    expect_true("kv4: the packed nibbles are the host quantizer's (within a rounding tie)", host_dev_max <= 1.0);
+    expect_true("kv4: fp8 V's relative RMS error under 5% (the block carries fat outliers)", std::sqrt(e8_ss / x_ss) < 0.05);
+    expect_true("kv4: v4 V's relative RMS error under 15%", std::sqrt(e4_ss / x_ss) < 0.15);
+
+    // the decode over the same keys: fp8 and v4 against an F32 cache of the exact (pre-quantization) K and V
+    const int Hkv = KV, nkeys = T;
+    std::vector<float> kx((size_t) nkeys * KV * D), vx((size_t) nkeys * KV * D);
+    for (size_t row = 0; row < (size_t) nkeys * KV; ++row) {
+        const float* kp = k_in.data() + row * D;
+        const float* vp = v_in.data() + row * D;
+        double sk = 0, sv = 0;
+        for (int d = 0; d < D; ++d) sk += (double) kp[d] * kp[d], sv += (double) vp[d] * vp[d];
+        const double fk = std::min(1.0, (double) qk_clip / (std::sqrt(sk) + 1e-6));
+        const double rs = 1.0 / std::sqrt(sv / D + eps);
+        for (int d = 0; d < D; ++d) kx[row * D + d] = (float) (kp[d] * fk), vx[row * D + d] = (float) (vp[d] * rs);
+    }
+    float *dkx = dev(kx), *dvx = dev(vx);
+    float* da = dev_n<float>((size_t) H * D);   // attention output, fp8 arm
+    float* db = dev_n<float>((size_t) H * D);   // v4 arm
+    float* dx32 = dev_n<float>((size_t) H * D); // F32 arm
+    float* scratch = dev_n<float>((size_t) H * 128 * 130 + (size_t) H * 8 * 130);
+    std::vector<float> qh((size_t) H * D), rh((size_t) H * d_rel), shk(H), proj((size_t) 1024 * d_rel);
+    for (size_t i = 0; i < qh.size(); ++i) qh[i] = frand(1.5f) * 0.1f;
+    for (size_t i = 0; i < rh.size(); ++i) rh[i] = frand(1.0f);
+    for (int i = 0; i < H; ++i) shk[i] = frand(1.0f);
+    for (size_t i = 0; i < proj.size(); ++i) proj[i] = frand(1.0f);
+    auto dqh = dev(qh), drh = dev(rh), dshk = dev(shk), dpr = dev(proj);
+    const float qk = (float) (1.0 / std::sqrt(128.0));
+    k::attn_decode(dqh, drh, dshk, dkx, dvx, H, Hkv, D, 0, nkeys, nkeys - 1, qk, dpr, d_rel, nkeys, 1 << 30, scratch,
+                   dx32, 0);
+    k::attn_decode_fp8(dqh, drh, dshk, dkc, dvc8, 0, H, Hkv, D, 0, nkeys, nkeys - 1, qk * k_inv, v_inv, dpr, d_rel,
+                       nkeys, 1 << 30, scratch, da, 0);
+    k::attn_decode_v4(dqh, drh, dshk, dkc2, dvc4, dvs4, 0, H, Hkv, D, 0, nkeys, nkeys - 1, qk * k_inv, dpr, d_rel,
+                      nkeys, 1 << 30, scratch, db, 0);
+    const auto hx = host(dx32, (size_t) H * D), ha = host(da, (size_t) H * D), hb = host(db, (size_t) H * D);
+    double mx = 0, m8 = 0, m4 = 0, r8 = 0, r4 = 0, xss = 0;
+    for (size_t i = 0; i < hx.size(); ++i) {
+        const double e8 = std::fabs((double) ha[i] - hx[i]), e4 = std::fabs((double) hb[i] - hx[i]);
+        m8 = std::max(m8, e8), m4 = std::max(m4, e4);
+        r8 += e8 * e8, r4 += e4 * e4, xss += (double) hx[i] * hx[i];
+    }
+    const double rms = std::sqrt(xss / hx.size());
+    std::printf("kv4 decode (%d keys, split + combine), against the exact F32 attention (output RMS %.4f): "
+                "fp8 arm max |err| %.5f, RMS %.5f; v4 arm max |err| %.5f, RMS %.5f\n",
+                nkeys, rms, m8, std::sqrt(r8 / hx.size()), m4, std::sqrt(r4 / hx.size()));
+    mx = std::max(m8, m4);
+    (void) mx;
+    expect_true("kv4 decode: the v4 arm's RMS error is under 20% of the output RMS", std::sqrt(r4 / xss) < 0.20);
+    expect_true("kv4 decode: the v4 arm's error tracks its V's quantization (within 6x the fp8 arm's)", r4 <= 36.0 * r8 + 1e-12);
+    for (void* p : {(void*) dq, (void*) dqc, (void*) dk, (void*) dv, (void*) dr, (void*) drc, (void*) dkc,
+                    (void*) dkc2, (void*) dvc8, (void*) dvc4, (void*) dvs4, (void*) dpos, (void*) da, (void*) db,
+                    (void*) scratch, (void*) dqh, (void*) drh, (void*) dshk, (void*) dpr, (void*) dkx, (void*) dvx,
+                    (void*) dx32})
+        cudaFree(p);
+}
+
 void test_attn_decode() {
     const int H = 48, KV = 8, D = 128, d_rel = 16, ctx = 3000;
     struct Case {
@@ -2697,6 +2872,7 @@ int main() {
     test_attn_f16();
     test_round2_fused();
     test_fp8_kv();
+    test_kv4();
     test_round6();
     test_attn_flash();   // (last: its random data leaves the others' as they were)
     test_attn_decode_mma();
