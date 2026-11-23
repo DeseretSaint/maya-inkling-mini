@@ -2345,6 +2345,13 @@ __global__ void guard_scan_kernel(const float* x, int ld, int n, int rows, Guard
         if (c) atomicAdd(&out->count, c), atomicMin(&out->first_p1, f + 1);
     }
 }
+// reset the scan's result: count 0, first_p1 at its "none yet" sentinel.  A one-thread kernel, not a memset: the
+// scan is captured into the token graph, and a plain memset would leave first_p1 at 0, so atomicMin could never
+// record an index (min(0, first+1) is always 0) and the reported index was -1 for every fault.
+__global__ void guard_reset_kernel(GuardScan* out) {
+    if (blockIdx.x || threadIdx.x) return;
+    out->count = 0, out->first_p1 = 0x7fffffff;
+}
 // the rows just computed, queued for the scan: call after the head's product and before any token is chosen
 static void guard_scan(const float* d_logits, int ld, int rows, int n) {
     if (!guard_on() || rows <= 0) return;
@@ -2354,7 +2361,7 @@ static void guard_scan(const float* d_logits, int ld, int rows, int n) {
     CU(cudaGetDevice(&dev));
     GuardScan* out = g_gs_d[dev >= 0 && dev < 8 ? dev : 0];
     const int blocks = std::min(1024, (n + 255) / 256);
-    CU(cudaMemsetAsync(out, 0, sizeof(GuardScan), g_s));
+    guard_reset_kernel<<<1, 1, 0, g_s>>>(out);
     guard_scan_kernel<<<blocks, 256, 0, g_s>>>(d_logits, ld, n, rows, out);
     CU(cudaMemcpyAsync(g_gs_h, out, sizeof(GuardScan), cudaMemcpyDeviceToHost, g_s));
 }
