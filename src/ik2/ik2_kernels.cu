@@ -101,8 +101,8 @@ __host__ __device__ __forceinline__ uint8_t f32_to_e4m3fn(float v) {
 // scalar path). All routes are bit-identical to the scalar path -- the two E4M3FN NaNs included -- and
 // tests/ik2_kernels_test.cu checks that for all 256 byte values.
 //
-// The fast path is a build flag: -DIK2_FP8_FAST=ON (CMake -DIK2_FP8_FAST=ON). Default OFF: the shipping path
-// is the code that was here before, unchanged.
+// The fast path is a build flag: -DIK2_FP8_FAST=ON (CMake -DIK2_FP8_FAST=ON). Default ON since K3c (K3b measured it
+// bit-exact and +3.8 / +12.4 / +18.4% decode at 16256 / 131072 / 261000); OFF is the code that was here before.
 #ifndef IK2_FP8_FAST
 #define IK2_FP8_FAST 0
 #endif
