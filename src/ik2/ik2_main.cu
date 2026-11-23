@@ -4423,11 +4423,198 @@ void embed_row(Model& M, int t, float* raw, float* out) {
     k::rms(raw, M.embd_norm, 1, C, M.c.eps, out, g_s);
 }
 
+// ---- --dump-ref / --kld-eval: a distribution gate for kernel changes
+//
+// Token agreement is a weak gate: a kernel can be wrong in a way that keeps the argmax for 128 tokens and still
+// damages long-context quality.  These two modes clone Strata's `cmd_kld_eval` (engine/src/inkling2/ink_main.cpp
+// :233-300): one build dumps the teacher-forced logits of one fixed text, and every later build is scored against
+// that file by KLD, top-1 agreement and PPL.  The reference is the measuring stick the kernel cards are held to, so
+// the format is guarded - magic, version, dtype, vocab, row count, token count and prefill chunk must all agree
+// with the run, or the mode refuses instead of printing a meaningless number.
+//
+// The file, all fields little-endian (x86-64, this engine's only target):
+//   char   magic[8]   "IK2KLD01"
+//   uint32 version    1
+//   uint32 dtype      0 = float32 logits rows
+//   uint32 rows       logits rows (== n_tok: one per text position)
+//   uint32 vocab      n_vocab of the model that dumped it
+//   uint32 n_tok      the fixed text, as token ids
+//   uint32 chunk      the --chunk it was prefilled at (a different chunk is not output-identical)
+//   uint32 reserved   0
+//   int32  ids[n_tok]
+//   float  logits[rows][vocab]
+static const char kKldMagic[8] = {'I', 'K', '2', 'K', 'L', 'D', '0', '1'};
+static const uint32_t kKldVersion = 1;
+static const uint32_t kKldF32 = 0;
+
+struct KldRef {
+    std::vector<int> ids;         // the fixed text, as token ids
+    std::vector<float> logits;    // [rows][vocab], the reference's raw logits
+    uint32_t version = 0, dtype = 0, rows = 0, vocab = 0, chunk = 0;
+};
+
+static const size_t kKldHeaderBytes = 8 + 7 * 4;
+
+static uint64_t kld_ids_hash(const std::vector<int>& ids) {   // FNV-1a over the id list: names the exact text
+    uint64_t h = 1469598103934665603ull;
+    for (int id : ids) {
+        const uint32_t v = (uint32_t) id;
+        for (int b = 0; b < 4; ++b) {
+            h ^= (v >> (8 * b)) & 0xffu;
+            h *= 1099511628211ull;
+        }
+    }
+    return h;
+}
+
+// the logits of every position of `ids` in one causal pass per chunk - the path a prompt takes under --dump
+// (all_logits, OutMode::kLogits).  --dump-ref and --kld-eval share it, which is why a self-evaluation is bit-exact:
+// the same kernels see the same shapes, so the arithmetic cannot differ by so much as a rounding.
+static void kld_forward_logits(Model& M, const std::vector<int>& ids, int chunk, std::vector<float>& out) {
+    out.clear();
+    double t_exp = 0;
+    for (int p0 = 0; p0 < (int) ids.size(); p0 += chunk) {
+        const int n = (int) std::min<size_t>((size_t) chunk, ids.size() - (size_t) p0);
+        std::vector<float> lo;
+        std::vector<int> ag;
+        forward(M, ids.data() + p0, n, p0, true, OutMode::kLogits, std::string(), lo, &ag, t_exp);
+        out.insert(out.end(), lo.begin(), lo.end());
+    }
+}
+
+static void kld_write_ref(const std::string& path, const KldRef& r) {
+    FILE* f = std::fopen(path.c_str(), "wb");
+    if (!f) die("--dump-ref: cannot write " + path);
+    const uint32_t hdr[7] = {kKldVersion, kKldF32, r.rows, r.vocab, (uint32_t) r.ids.size(), r.chunk, 0};
+    std::fwrite(kKldMagic, 1, 8, f);
+    std::fwrite(hdr, 4, 7, f);
+    std::fwrite(r.ids.data(), 4, r.ids.size(), f);
+    std::fwrite(r.logits.data(), 4, r.logits.size(), f);
+    const bool ok = std::ferror(f) == 0 && std::fflush(f) == 0;
+    std::fclose(f);
+    if (!ok) die("--dump-ref: writing " + path + " failed (disk full?)");
+}
+
+// every guard here exists because a mismatched reference produces a number that looks fine and means nothing
+static KldRef kld_read_ref(const std::string& path, int vocab, int chunk) {
+    FILE* f = std::fopen(path.c_str(), "rb");
+    if (!f) die("--kld-eval: cannot read the reference " + path);
+    KldRef r;
+    char magic[8] = {0};
+    uint32_t hdr[7] = {0};
+    if (std::fread(magic, 1, 8, f) != 8 || std::fread(hdr, 4, 7, f) != 7) {
+        std::fclose(f);
+        die("--kld-eval: " + path + " is shorter than a reference header - not an ik2 KLD reference");
+    }
+    if (std::memcmp(magic, kKldMagic, 8) != 0) {
+        std::fclose(f);
+        die("--kld-eval: " + path + ": bad magic - not an ik2 KLD reference (expected IK2KLD01)");
+    }
+    r.version = hdr[0], r.dtype = hdr[1], r.rows = hdr[2], r.vocab = hdr[3], r.chunk = hdr[5];
+    const uint32_t n_tok = hdr[4];
+    if (r.version != kKldVersion) {
+        std::fclose(f);
+        die("--kld-eval: " + path + ": reference version " + std::to_string(r.version) + ", this build reads version " +
+            std::to_string(kKldVersion) + " - re-dump it");
+    }
+    if (r.dtype != kKldF32) {
+        std::fclose(f);
+        die("--kld-eval: " + path + ": dtype " + std::to_string(r.dtype) + " (this build reads float32 = 0)");
+    }
+    if ((int) r.vocab != vocab) {
+        std::fclose(f);
+        die("--kld-eval: " + path + ": vocab " + std::to_string(r.vocab) + " but the model's is " + std::to_string(vocab) +
+            " - the reference came from a different model or a different GGUF");
+    }
+    if (r.rows != n_tok) {
+        std::fclose(f);
+        die("--kld-eval: " + path + ": header disagrees with itself - " + std::to_string(r.rows) + " logits rows for " +
+            std::to_string(n_tok) + " tokens");
+    }
+    if (n_tok < 2) {
+        std::fclose(f);
+        die("--kld-eval: " + path + " holds " + std::to_string(n_tok) + " tokens; a KLD needs at least 2");
+    }
+    if (r.chunk != (uint32_t) chunk) {
+        std::fclose(f);
+        die("--kld-eval: " + path + " was dumped at --chunk " + std::to_string(r.chunk) + ", this run is --chunk " +
+            std::to_string(chunk) + " (a different chunk is not output-identical) - pass --chunk " +
+            std::to_string(r.chunk));
+    }
+    const size_t want = kKldHeaderBytes + (size_t) n_tok * 4 + (size_t) r.rows * r.vocab * 4;
+    if (std::fseek(f, 0, SEEK_END) != 0 || (size_t) std::ftell(f) != want) {
+        const long got = std::ftell(f);
+        std::fclose(f);
+        die("--kld-eval: " + path + " is " + std::to_string(got) + " bytes, its header says " + std::to_string(want) +
+            " - truncated or padded");
+    }
+    std::rewind(f);
+    std::fseek(f, (long) kKldHeaderBytes, SEEK_SET);
+    r.ids.resize(n_tok);
+    r.logits.resize((size_t) r.rows * r.vocab);
+    const bool ok = std::fread(r.ids.data(), 4, r.ids.size(), f) == r.ids.size() &&
+                    std::fread(r.logits.data(), 4, r.logits.size(), f) == r.logits.size();
+    std::fclose(f);
+    if (!ok) die("--kld-eval: " + path + ": short read");
+    return r;
+}
+
+// Strata's arithmetic, verbatim: per position kld += pv * (lp - lq) with both sides a softmax in double, plus NLL
+// (of the candidate, so PPL is this build's), top-1 agreement, and the logit drift for a diagnosis.
+static int kld_report(const KldRef& ref, const std::vector<float>& cand, const std::string& path, double kld_max) {
+    const int V = (int) ref.vocab;
+    const size_t n = ref.rows;
+    double kld = 0, nll_p = 0, nll_q = 0, dmax = 0, dsum = 0;
+    long long agree = 0;
+    for (size_t t = 0; t < n; ++t) {
+        const float* p = ref.logits.data() + t * (size_t) V;
+        const float* q = cand.data() + t * (size_t) V;
+        double mp = -1e30, mq = -1e30;
+        for (int v = 0; v < V; ++v) mp = std::max(mp, (double) p[v]), mq = std::max(mq, (double) q[v]);
+        double sp = 0, sq = 0;
+        for (int v = 0; v < V; ++v) sp += std::exp((double) p[v] - mp), sq += std::exp((double) q[v] - mq);
+        const double lse_p = mp + std::log(sp), lse_q = mq + std::log(sq);
+        int ip = 0, iq = 0;
+        for (int v = 0; v < V; ++v) {
+            const double lp = (double) p[v] - lse_p, lq = (double) q[v] - lse_q;
+            kld += std::exp(lp) * (lp - lq);
+            const double d = std::fabs(lp - lq);
+            dmax = std::max(dmax, d), dsum += d;
+            if (p[v] > p[ip]) ip = v;
+            if (q[v] > q[iq]) iq = v;
+        }
+        agree += ip == iq;
+        if (t + 1 < ref.ids.size()) {   // (row t predicts token t+1: the last row has no target)
+            nll_p += -((double) p[ref.ids[t + 1]] - lse_p);
+            nll_q += -((double) q[ref.ids[t + 1]] - lse_q);
+        }
+    }
+    const double mean_kld = kld / (double) n;
+    const double top1 = 100.0 * (double) agree / (double) n;
+    const double ppl = std::exp(nll_q / (double) (n - 1));
+    std::printf("[kld-eval] n=%zu | Mean KLD=%.6f | Top-1=%.2f%% | PPL=%.3f\n", n, mean_kld, top1, ppl);
+    std::printf("[kld-eval] reference %s (v%u, f32, rows=%u, vocab=%d, chunk=%u, ids fnv1a %016llx); "
+                "NLL=%.4f over %zu targets (reference NLL=%.4f); mean|dlogit|=%.3e, max|dlogit|=%.3e\n",
+                path.c_str(), ref.version, ref.rows, V, ref.chunk,
+                (unsigned long long) kld_ids_hash(ref.ids), nll_q / (double) (n - 1), n - 1,
+                nll_p / (double) (n - 1), dsum / ((double) n * V), dmax);
+    std::fflush(stdout);
+    if (kld_max >= 0) {
+        const bool pass = mean_kld <= kld_max;
+        std::printf("[kld-eval] %s: Mean KLD %.6f %s the budget %.6f\n", pass ? "PASS" : "FAIL", mean_kld,
+                    pass ? "<=" : ">", kld_max);
+        std::fflush(stdout);
+        return pass ? 0 : 3;
+    }
+    return 0;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string model, toks, dump, draft_path;
+    std::string model, toks, dump, draft_path, dump_ref, kld_ref;
     int gen = 16, chunk = 2048, ctx = 262144, threads = 8, n_gpu = 1;
+    double kld_max = -1;                      // --kld-max X: exit 3 when Mean KLD is over X (the gate)
     bool serve = false, serve_maya = true;   // (--serve: Maya's engine protocol; --serve-ik2: the @-line one)
     std::vector<int> eos_ids;                 // --eos a,b: the tokens a request ends at (Maya's protocol)
     double cache_gb = 60;
@@ -4466,6 +4653,9 @@ int main(int argc, char** argv) {
         }
         else if (a == "--image-token") image_token = std::atoi(next().c_str());
         else if (a == "--dump") dump = next();
+        else if (a == "--dump-ref") dump_ref = next();
+        else if (a == "--kld-eval") kld_ref = next();
+        else if (a == "--kld-max") kld_max = std::atof(next().c_str());
         else die("unknown argument " + a);
     }
     g_prof = getenv("IK2_PROF") && std::atoi(getenv("IK2_PROF")) == 1;
@@ -4490,8 +4680,10 @@ int main(int argc, char** argv) {
         if (!g_trace) die(std::string("cannot write ") + getenv("IK2_TRACE"));
     }
     g_serve_note = serve && serve_maya;
-    if (model.empty() || (toks.empty() && !serve))
-        die("usage: maya-ik2 --model FIRST.gguf (--tokens 1,2,3 [--gen N] | --serve) [--chunk 2048] [--ctx N] ...");
+    if (model.empty() || (toks.empty() && !serve && kld_ref.empty()))
+        die("usage: maya-ik2 --model FIRST.gguf (--tokens *** [--gen N] | --serve) [--chunk 2048] [--ctx N] ...\n"
+            "       maya-ik2 --model FIRST.gguf --tokens *** --dump-ref REF.bin\n"
+            "       maya-ik2 --model FIRST.gguf --kld-eval REF.bin [--kld-max X]");
     std::vector<int> prompt;
     for (const char* p = toks.c_str(); *p;) {
         prompt.push_back(std::atoi(p));
@@ -6035,6 +6227,36 @@ int main(int argc, char** argv) {
             busy = false;
         }
         return 0;
+    }
+    // ---- --dump-ref / --kld-eval: teacher-force the fixed text and either write the reference or score against it.
+    // Both modes return before any sampling, so the gate never touches the sampler, the prefill scheduling or the KV
+    // code.  The same 512-token text and the same --chunk must be used for both, or the file is refused.
+    if (!dump_ref.empty() || !kld_ref.empty()) {
+        if (!dump_ref.empty() && !kld_ref.empty()) die("--dump-ref and --kld-eval are separate modes");
+        if (!dump_ref.empty()) {
+            if (prompt.size() < 2) die("--dump-ref: the text needs at least 2 tokens");
+            if ((int) prompt.size() > ctx) die("--dump-ref: the text is past --ctx");
+            KldRef r;
+            r.ids = prompt;
+            r.rows = (uint32_t) prompt.size();
+            r.vocab = (uint32_t) c.n_vocab;
+            r.chunk = (uint32_t) chunk;
+            const double t0 = now();
+            kld_forward_logits(M, r.ids, chunk, r.logits);
+            kld_write_ref(dump_ref, r);
+            std::printf("[dump-ref] %zu tokens -> %s in %.2f s; vocab %d, chunk %d, %zu bytes, ids fnv1a %016llx\n",
+                        r.ids.size(), dump_ref.c_str(), now() - t0, c.n_vocab, chunk,
+                        kKldHeaderBytes + r.ids.size() * 4 + r.logits.size() * 4,
+                        (unsigned long long) kld_ids_hash(r.ids));
+            std::fflush(stdout);
+            return 0;
+        }
+        if (!toks.empty()) die("--kld-eval reads its tokens from the reference: drop --tokens");
+        const KldRef r = kld_read_ref(kld_ref, c.n_vocab, chunk);
+        if ((int) r.ids.size() > ctx) die("--kld-eval: the reference's text is past --ctx");
+        std::vector<float> cand;
+        kld_forward_logits(M, r.ids, chunk, cand);
+        return kld_report(r, cand, kld_ref, kld_max);
     }
     if ((int) prompt.size() + gen > ctx) die("prompt + gen past --ctx");
     // the prompt
