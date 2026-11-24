@@ -4653,7 +4653,7 @@ void report_repetition_loop(FILE* to, const std::vector<int>& ids, int period, i
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string model, toks, dump, draft_path, dump_ref, kld_ref;
+    std::string model, toks, dump, draft_path, dump_ref, kld_ref, cand_out;
     int gen = 16, chunk = 2048, ctx = 262144, threads = 8, n_gpu = 1;
     int ref_window = 0;                       // --ref-window N: dump only the LAST N logits rows (depth scoring)
     double kld_max = -1;                      // --kld-max X: exit 3 when Mean KLD is over X (the gate)
@@ -4698,6 +4698,7 @@ int main(int argc, char** argv) {
         else if (a == "--dump-ref") dump_ref = next();
         else if (a == "--ref-window") ref_window = std::atoi(next().c_str());
         else if (a == "--kld-eval") kld_ref = next();
+        else if (a == "--cand-out") cand_out = next();
         else if (a == "--kld-max") kld_max = std::atof(next().c_str());
         else die("unknown argument " + a);
     }
@@ -6315,6 +6316,12 @@ int main(int argc, char** argv) {
         if ((int) r.ids.size() > ctx) die("--kld-eval: the reference's text is past --ctx");
         std::vector<float> cand;
         kld_forward_logits(M, r.ids, chunk, cand, (int) r.rows);
+        if (!cand_out.empty()) {   // the candidate's own window rows, in the reference format, for paired statistics
+            KldRef o;
+            o.ids = r.ids, o.logits = cand, o.vocab = r.vocab, o.chunk = r.chunk, o.rows = r.rows, o.start = r.start;
+            kld_write_ref(cand_out, o);
+            std::printf("[cand-out] rows [%u,%u) -> %s\n", o.start, o.start + o.rows, cand_out.c_str());
+        }
         return kld_report(r, cand, kld_ref, kld_max);
     }
     if ((int) prompt.size() + gen > ctx) die("prompt + gen past --ctx");
