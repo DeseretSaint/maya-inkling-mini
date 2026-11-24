@@ -139,17 +139,22 @@ def cmd_perturb(args) -> int:
     return 0
 
 
+def _log_softmax(logits):
+    """log softmax in float64, row by row, with the max shift the engine uses."""
+    import numpy as np
+
+    x = logits.astype(np.float64)
+    m = x.max(axis=1, keepdims=True)
+    return x - (m + np.log(np.exp(x - m).sum(axis=1, keepdims=True)))
+
+
 def _scores(ref_logits, cand_logits, ids):
     import numpy as np
 
-    p = ref_logits.astype(np.float64)
-    q = cand_logits.astype(np.float64)
-    lp = p - (p.max(axis=1, keepdims=True) + np.log(np.exp(p - p.max(axis=1, keepdims=True)).sum(axis=1,
-                                                                                           keepdims=True)))
-    lq = q - (q.max(axis=1, keepdims=True) + np.log(np.exp(q - q.max(axis=1, keepdims=True)).sum(axis=1,
-                                                                                           keepdims=True)))
+    lp = _log_softmax(ref_logits)
+    lq = _log_softmax(cand_logits)
     kld = float((np.exp(lp) * (lp - lq)).sum(axis=1).mean())
-    top1 = float((p.argmax(axis=1) == q.argmax(axis=1)).mean()) * 100.0
+    top1 = float((ref_logits.argmax(axis=1) == cand_logits.argmax(axis=1)).mean()) * 100.0
     tgt = np.asarray(ids[1:], dtype=np.int64)
     nll = float(-lq[:-1][np.arange(len(tgt)), tgt].mean())
     return kld, top1, float(np.exp(nll)), nll
@@ -164,7 +169,12 @@ def cmd_compare(args) -> int:
     if a["ids"] != b["ids"]:
         raise SystemExit("the two files are logits over different token ids")
     kld, top1, ppl, nll = _scores(a["logits"], b["logits"], a["ids"])
-    d = np.abs(a["logits"].astype(np.float64) - b["logits"].astype(np.float64))
+    # the same quantity the engine prints: drift in log-probability space, not in raw logits (a raw-logit
+    # difference and a log-prob difference are different scales, and only the second one is comparable
+    # with --kld-eval's mean|dlogit| line)
+    la = _log_softmax(a["logits"])
+    lb = _log_softmax(b["logits"])
+    d = np.abs(la - lb)
     print(f"n={a['rows']} | Mean KLD={kld:.6f} | Top-1={top1:.2f}% | PPL={ppl:.3f}")
     print(f"mean|dlogit|={d.mean():.3e} max|dlogit|={d.max():.3e} NLL={nll:.4f}")
     return 0

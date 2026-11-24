@@ -99,3 +99,51 @@ A number from this tool is a claim about the metric until it is proven both ways
    A *different numerics configuration* of the same engine (a kernel path off, another KV type) is the
    real cross-build check; `tools/kld/kld_ref.py compare a.bin b.bin` recomputes the same KLD, top-1 and
    PPL in numpy, independently of the C++.
+
+`tools/kld/prove-gate.sh` runs all of that against one binary and exits non-zero unless it holds:
+
+```bash
+IK2_BIN=./build-hip-kld/maya-ik2 IK2_MODEL=…/Inkling-2-Mini-UD-Q4_K_XL.gguf \
+  tools/kld/prove-gate.sh /tmp/ik2-gate
+```
+
+## Measured: the proving run on `ik2/kld-eval`
+
+Evidence for the instrument, not for the model. Binary `build-hip-kld/maya-ik2` sha256
+`182163fb867af4dc710d784af5ef1af5aa51bf646c293efbd730519769e78cbc` from commit `e4b6c32`; model
+`Inkling-2-Mini-UD-Q4_K_XL.gguf`; `--ctx 4096 --cache-gb 4`, default `--chunk 2048`, default (f16) KV.
+The reference this build dumped is `ref.bin`, sha256
+`de14da3dd62b383de5edbfebf7f8905d3fe0917296dd2bb971c97bb1d73e6537`.
+
+| run | reference | Mean KLD | Top-1 | mean\|dlogit\| |
+|---|---|---|---|---|
+| self-control: this build against its own dump | `ref.bin` | **0.000000** | 100.00% | 0.000e+00 |
+| numpy witness of the same pair (`kld_ref.py compare`) | `ref.bin` vs `ref.bin` | **0.000000** | 100.00% | 0.000e+00 |
+| row 17 scaled 1.05 | `ref.bin` perturbed | **0.000002** | 100.00% | 2.916e-03 |
+| row 17 scaled 2.00 | `ref.bin` perturbed | **0.000038** | 100.00% | 5.851e-02 |
+| `IK2_KV=fp8` against the f16 reference | `ref.bin` | **0.005106** | 99.22% | 3.569e-01 |
+
+Read the last two rows together with the Top-1 column: the x2.00 perturbation moves Mean KLD by 3.8e-5
+while top-1 stays at 100.00% — exactly the wrong-but-argmax-identical failure a token-agreement gate
+cannot see, and the reason this instrument exists. `IK2_KV=fp8` is a real numerics change of the same
+engine: 0.005106 on this 512-token text (the same order as the 0.004552 that Kintsugi's q4_0-global
+cites on their own text, and as P6-1's 0.0059 on 2048 prose targets at 32K — different text, not
+comparable directly).
+
+The guards were exercised too: a reference with a wrong magic is refused (`bad magic - not an ik2 KLD
+reference`), one whose header vocab is off by one is refused (`vocab 200057 but the model's is
+200058`), and `--kld-max 0` on the perturbed file exits **3** (`FAIL: Mean KLD 0.000038 > the budget
+0.000000`) while the self-control passes the same gate at `--kld-max 0.000001`.
+
+Cross-build note: the P6-1 instrument (`~/Projects/maya-ik2-ppl/build-ppl/maya-ik2`
+`854b8430d4173788…`, built from `5ad408b` + `--ref-window`/`--cand-out`) dumped the same 512 tokens to
+**byte-identical logits** (sha256 of the logits block `19808afd59cf83aa…`), so the two independent
+implementations of this format and this forward path agree exactly.
+
+## Per class, not one aggregate
+
+The file carries its own token ids, so a class split needs no new code: dump one reference per class
+and score each. Keep `ref-512.txt` fixed as the common baseline and add e.g. `ref-toolcall.txt` /
+`ref-code.txt` next to it, each with its committed `.tokens`. An aggregate over mixed text hides a
+class-specific regression: P6-1 measured in-domain code ~10x cleaner than prose at 32K/128K
+(`runs/P6-1-ppl-longctx.md`), and user/tool text past ~1,000 tokens is the class that degrades first.
