@@ -4450,7 +4450,7 @@ static const uint32_t kKldF32 = 0;
 struct KldRef {
     std::vector<int> ids;         // the fixed text, as token ids
     std::vector<float> logits;    // [rows][vocab], the reference's raw logits
-    uint32_t version = 0, dtype = 0, rows = 0, vocab = 0, chunk = 0;
+    uint32_t version = 0, dtype = 0, rows = 0, vocab = 0, chunk = 0, start = 0;
 };
 
 static const size_t kKldHeaderBytes = 8 + 7 * 4;
@@ -4470,22 +4470,33 @@ static uint64_t kld_ids_hash(const std::vector<int>& ids) {   // FNV-1a over the
 // the logits of every position of `ids` in one causal pass per chunk - the path a prompt takes under --dump
 // (all_logits, OutMode::kLogits).  --dump-ref and --kld-eval share it, which is why a self-evaluation is bit-exact:
 // the same kernels see the same shapes, so the arithmetic cannot differ by so much as a rounding.
-static void kld_forward_logits(Model& M, const std::vector<int>& ids, int chunk, std::vector<float>& out) {
+// `window` > 0 keeps only the LAST `window` rows: the passes that end before the window run with OutMode::kNone, so
+// scoring a 256K prefix costs one ordinary prefill plus the logits of the window's chunk, not 206 GB of host rows.
+static void kld_forward_logits(Model& M, const std::vector<int>& ids, int chunk, std::vector<float>& out,
+                               int window = 0) {
     out.clear();
     double t_exp = 0;
-    for (int p0 = 0; p0 < (int) ids.size(); p0 += chunk) {
+    const int n_ids = (int) ids.size();
+    const int V = M.c.n_vocab;
+    const int start = window > 0 ? n_ids - window : 0;
+    if (window > n_ids) die("--ref-window: the window is longer than the text");
+    for (int p0 = 0; p0 < n_ids; p0 += chunk) {
         const int n = (int) std::min<size_t>((size_t) chunk, ids.size() - (size_t) p0);
+        const bool need = p0 + n > start;   // does any row of this pass fall inside the window?
         std::vector<float> lo;
         std::vector<int> ag;
-        forward(M, ids.data() + p0, n, p0, true, OutMode::kLogits, std::string(), lo, &ag, t_exp);
-        out.insert(out.end(), lo.begin(), lo.end());
+        forward(M, ids.data() + p0, n, p0, need, need ? OutMode::kLogits : OutMode::kNone, std::string(), lo, &ag,
+                t_exp);
+        if (!need) continue;
+        const int from = std::max(0, start - p0);   // first row of this pass inside the window
+        out.insert(out.end(), lo.begin() + (size_t) from * V, lo.end());
     }
 }
 
 static void kld_write_ref(const std::string& path, const KldRef& r) {
     FILE* f = std::fopen(path.c_str(), "wb");
     if (!f) die("--dump-ref: cannot write " + path);
-    const uint32_t hdr[7] = {kKldVersion, kKldF32, r.rows, r.vocab, (uint32_t) r.ids.size(), r.chunk, 0};
+    const uint32_t hdr[7] = {kKldVersion, kKldF32, r.rows, r.vocab, (uint32_t) r.ids.size(), r.chunk, r.start};
     std::fwrite(kKldMagic, 1, 8, f);
     std::fwrite(hdr, 4, 7, f);
     std::fwrite(r.ids.data(), 4, r.ids.size(), f);
@@ -4510,7 +4521,7 @@ static KldRef kld_read_ref(const std::string& path, int vocab, int chunk) {
         std::fclose(f);
         die("--kld-eval: " + path + ": bad magic - not an ik2 KLD reference (expected IK2KLD01)");
     }
-    r.version = hdr[0], r.dtype = hdr[1], r.rows = hdr[2], r.vocab = hdr[3], r.chunk = hdr[5];
+    r.version = hdr[0], r.dtype = hdr[1], r.rows = hdr[2], r.vocab = hdr[3], r.chunk = hdr[5], r.start = hdr[6];
     const uint32_t n_tok = hdr[4];
     if (r.version != kKldVersion) {
         std::fclose(f);
@@ -4526,10 +4537,10 @@ static KldRef kld_read_ref(const std::string& path, int vocab, int chunk) {
         die("--kld-eval: " + path + ": vocab " + std::to_string(r.vocab) + " but the model's is " + std::to_string(vocab) +
             " - the reference came from a different model or a different GGUF");
     }
-    if (r.rows != n_tok) {
+    if (r.rows > n_tok || r.start + r.rows != n_tok) {
         std::fclose(f);
-        die("--kld-eval: " + path + ": header disagrees with itself - " + std::to_string(r.rows) + " logits rows for " +
-            std::to_string(n_tok) + " tokens");
+        die("--kld-eval: " + path + ": header disagrees with itself - " + std::to_string(r.rows) +
+            " logits rows starting at " + std::to_string(r.start) + " for " + std::to_string(n_tok) + " tokens");
     }
     if (n_tok < 2) {
         std::fclose(f);
@@ -4564,6 +4575,7 @@ static KldRef kld_read_ref(const std::string& path, int vocab, int chunk) {
 static int kld_report(const KldRef& ref, const std::vector<float>& cand, const std::string& path, double kld_max) {
     const int V = (int) ref.vocab;
     const size_t n = ref.rows;
+    const size_t off = (size_t) ref.start;   // row t is position start + t (a windowed reference starts late)
     double kld = 0, nll_p = 0, nll_q = 0, dmax = 0, dsum = 0;
     long long agree = 0;
     for (size_t t = 0; t < n; ++t) {
@@ -4584,9 +4596,9 @@ static int kld_report(const KldRef& ref, const std::vector<float>& cand, const s
             if (q[v] > q[iq]) iq = v;
         }
         agree += ip == iq;
-        if (t + 1 < ref.ids.size()) {   // (row t predicts token t+1: the last row has no target)
-            nll_p += -((double) p[ref.ids[t + 1]] - lse_p);
-            nll_q += -((double) q[ref.ids[t + 1]] - lse_q);
+        if (off + t + 1 < ref.ids.size()) {   // (row t predicts token t+1: the last row has no target)
+            nll_p += -((double) p[ref.ids[off + t + 1]] - lse_p);
+            nll_q += -((double) q[ref.ids[off + t + 1]] - lse_q);
         }
     }
     const double mean_kld = kld / (double) n;
@@ -4643,6 +4655,7 @@ void report_repetition_loop(FILE* to, const std::vector<int>& ids, int period, i
 int main(int argc, char** argv) {
     std::string model, toks, dump, draft_path, dump_ref, kld_ref;
     int gen = 16, chunk = 2048, ctx = 262144, threads = 8, n_gpu = 1;
+    int ref_window = 0;                       // --ref-window N: dump only the LAST N logits rows (depth scoring)
     double kld_max = -1;                      // --kld-max X: exit 3 when Mean KLD is over X (the gate)
     bool serve = false, serve_maya = true;   // (--serve: Maya's engine protocol; --serve-ik2: the @-line one)
     std::vector<int> eos_ids;                 // --eos a,b: the tokens a request ends at (Maya's protocol)
@@ -4683,6 +4696,7 @@ int main(int argc, char** argv) {
         else if (a == "--image-token") image_token = std::atoi(next().c_str());
         else if (a == "--dump") dump = next();
         else if (a == "--dump-ref") dump_ref = next();
+        else if (a == "--ref-window") ref_window = std::atoi(next().c_str());
         else if (a == "--kld-eval") kld_ref = next();
         else if (a == "--kld-max") kld_max = std::atof(next().c_str());
         else die("unknown argument " + a);
@@ -4711,7 +4725,7 @@ int main(int argc, char** argv) {
     g_serve_note = serve && serve_maya;
     if (model.empty() || (toks.empty() && !serve && kld_ref.empty()))
         die("usage: maya-ik2 --model FIRST.gguf (--tokens *** [--gen N] | --serve) [--chunk 2048] [--ctx N] ...\n"
-            "       maya-ik2 --model FIRST.gguf --tokens *** --dump-ref REF.bin\n"
+            "       maya-ik2 --model FIRST.gguf --tokens *** --dump-ref REF.bin [--ref-window W]\n"
             "       maya-ik2 --model FIRST.gguf --kld-eval REF.bin [--kld-max X]");
     std::vector<int> prompt;
     for (const char* p = toks.c_str(); *p;) {
@@ -6277,16 +6291,20 @@ int main(int argc, char** argv) {
         if (!dump_ref.empty()) {
             if (prompt.size() < 2) die("--dump-ref: the text needs at least 2 tokens");
             if ((int) prompt.size() > ctx) die("--dump-ref: the text is past --ctx");
+            if (ref_window < 0 || (ref_window > 0 && (size_t) ref_window > prompt.size()))
+                die("--ref-window: the window must be 1 .. the text's token count");
             KldRef r;
             r.ids = prompt;
-            r.rows = (uint32_t) prompt.size();
+            r.rows = ref_window > 0 ? (uint32_t) ref_window : (uint32_t) prompt.size();
+            r.start = (uint32_t) (prompt.size() - r.rows);
             r.vocab = (uint32_t) c.n_vocab;
             r.chunk = (uint32_t) chunk;
             const double t0 = now();
-            kld_forward_logits(M, r.ids, chunk, r.logits);
+            kld_forward_logits(M, r.ids, chunk, r.logits, ref_window);
             kld_write_ref(dump_ref, r);
-            std::printf("[dump-ref] %zu tokens -> %s in %.2f s; vocab %d, chunk %d, %zu bytes, ids fnv1a %016llx\n",
-                        r.ids.size(), dump_ref.c_str(), now() - t0, c.n_vocab, chunk,
+            std::printf("[dump-ref] %zu tokens, rows [%u,%u) -> %s in %.2f s; vocab %d, chunk %d, %zu bytes, "
+                        "ids fnv1a %016llx\n",
+                        r.ids.size(), r.start, r.start + r.rows, dump_ref.c_str(), now() - t0, c.n_vocab, chunk,
                         kKldHeaderBytes + r.ids.size() * 4 + r.logits.size() * 4,
                         (unsigned long long) kld_ids_hash(r.ids));
             std::fflush(stdout);
@@ -6296,7 +6314,7 @@ int main(int argc, char** argv) {
         const KldRef r = kld_read_ref(kld_ref, c.n_vocab, chunk);
         if ((int) r.ids.size() > ctx) die("--kld-eval: the reference's text is past --ctx");
         std::vector<float> cand;
-        kld_forward_logits(M, r.ids, chunk, cand);
+        kld_forward_logits(M, r.ids, chunk, cand, (int) r.rows);
         return kld_report(r, cand, kld_ref, kld_max);
     }
     if ((int) prompt.size() + gen > ctx) die("prompt + gen past --ctx");
