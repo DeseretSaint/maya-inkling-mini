@@ -139,6 +139,16 @@ void note(const std::string& m) {
     std::fflush(stdout);
 }
 
+// A token id is a row of the embedding table (embed_row: M.embd + (size_t) t * row_bytes).
+// Nothing used to check it: -5 read before the model and 2147483647 read ~687 GB past it -
+// the acceptance run measured SIGSEGV on the latter (R2, 2026-11-23).  Returns the first
+// index outside [0, vocab), or -1.
+int first_bad_id(const std::vector<int>& ids, int vocab) {
+    for (size_t i = 0; i < ids.size(); ++i)
+        if (ids[i] < 0 || ids[i] >= vocab) return (int) i;
+    return -1;
+}
+
 double now() { return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(); }
 
 // ---- the files
@@ -4687,6 +4697,15 @@ int main(int argc, char** argv) {
         else if (a == "--kld-max") kld_max = std::atof(next().c_str());
         else die("unknown argument " + a);
     }
+    // CLI sanity: these three used to be used unvalidated.  chunk 0 makes the prefill's
+    // `p0 += chunk` loop never advance (a hang, measured nothing because the run never
+    // returns); ctx 0 allocates a one-row KV ring that `kv_cap > 0 ? ... : pos` indexes
+    // linearly, i.e. past it; and a negative gen is refused by the generation loop but
+    // should say why (R2).
+    if (chunk < 1) die("--chunk must be >= 1");
+    if (ctx < 1) die("--max-context must be >= 1");
+    if (n_gpu < 1 || n_gpu > 8) die("--gpus must be 1 .. 8");
+    if (gen < 0) die("--gen is negative");
     g_prof = getenv("IK2_PROF") && std::atoi(getenv("IK2_PROF")) == 1;
     g_prof2 = getenv("IK2_PROF") && std::atoi(getenv("IK2_PROF")) == 2;
     g_tier_graph = getenv("IK2_GRAPH") && !g_fast_want ? std::atoi(getenv("IK2_GRAPH")) : 0;
@@ -4746,6 +4765,12 @@ int main(int argc, char** argv) {
     c.extent_swa = S.get(a + "rel_extent_swa") ? (int) key("rel_extent_swa") : c.window;   // (master: the window)
     c.block = (int) key("attn_res.block_size");
     c.n_vocab = (int) key("unpadded_vocab_size", "vocab_size_unpadded");
+    {   // --tokens carries ids too: the same range check the serve loop makes (R2)
+        const int bad = first_bad_id(prompt, c.n_vocab);
+        if (bad >= 0)
+            die("--tokens: id " + std::to_string(prompt[(size_t) bad]) + " at position " + std::to_string(bad) +
+                " is outside the vocabulary (0 .. " + std::to_string(c.n_vocab - 1) + ")");
+    }
     c.eps = (float) key("attention.layer_norm_rms_epsilon");
     c.route_scale = (float) key("expert_weights_scale");
     c.qk_clip = (float) key("qk_clip_threshold", "attention.qk_clip");
@@ -5950,14 +5975,28 @@ int main(int argc, char** argv) {
                 stops = parse_ints(stops_s);
             }
             const std::vector<int> ids = parse_ints(ids_s);
-            if (ids.empty() || (int) ids.size() + max_new > ctx) {
-                if (serve_maya)
-                    std::printf("ERR %s\nDONE 0 %zu 0 0 cancel 0 0 0\n",
-                                ids.empty() ? "an empty prompt" :
-                                    ("the prompt and max_tokens pass the context (" + std::to_string(ctx) + ")").c_str(),
-                                ids.size());
+            // Guard the request before any of it runs: `(int) ids.size() + max_new` wraps
+            // (16 + INT_MAX is negative), so INT_MAX passed the context test and generated
+            // until the KV ring wrapped - measured 1180 tokens before a STOP ended it (R2).
+            const int bad_id = first_bad_id(ids, c.n_vocab);
+            if (bad_id >= 0 || max_new < 0 || ids.empty() ||
+                (long long) ids.size() + (long long) max_new > (long long) ctx) {
+                std::string why;
+                if (bad_id >= 0)
+                    why = "token id " + std::to_string(ids[(size_t) bad_id]) + " at position " + std::to_string(bad_id) +
+                          " is outside the vocabulary (0 .. " + std::to_string(c.n_vocab - 1) + ")";
+                else if (max_new < 0)
+                    why = "max_tokens is negative";
+                else if (ids.empty())
+                    why = "an empty prompt";
                 else
-                    std::printf("@END error %s %zu 0 0 0\n", ids.empty() ? "empty_prompt" : "context_length", ids.size());
+                    why = "the prompt and max_tokens pass the context (" + std::to_string(ctx) + ")";
+                if (serve_maya)
+                    std::printf("ERR %s\nDONE 0 %zu 0 0 cancel 0 0 0\n", why.c_str(), ids.size());
+                else
+                    std::printf("@END error %s %zu 0 0 0\n", bad_id >= 0 ? "token_id_range" : max_new < 0 ? "negative_max_tokens"
+                                                                       : ids.empty() ? "empty_prompt" : "context_length",
+                                ids.size());
                 std::fflush(stdout);
                 continue;
             }
@@ -6143,6 +6182,12 @@ int main(int argc, char** argv) {
             SuffixStats suffix_stats;
             size_t next_placement = hist.size() + kPlacementInterval;
             for (int i = 0; i < max_new; ++i) {
+                // Second line of defence: no request decodes past the KV window, whatever the
+                // arithmetic above said (R2: the int check could be overflowed).
+                if (hist.size() >= (size_t) ctx) {
+                    reason = "length";
+                    break;
+                }
                 if (g_managed_experts && hist.size() >= next_placement) {
                     place_decode(M, (int)hist.size());
                     next_placement = hist.size() + kPlacementInterval;
@@ -6294,12 +6339,15 @@ int main(int argc, char** argv) {
         }
         if (!toks.empty()) die("--kld-eval reads its tokens from the reference: drop --tokens");
         const KldRef r = kld_read_ref(kld_ref, c.n_vocab, chunk);
+        if (first_bad_id(r.ids, c.n_vocab) >= 0)
+            die("--kld-eval: " + kld_ref + " holds a token id outside the vocabulary (0 .. " +
+                std::to_string(c.n_vocab - 1) + ")");
         if ((int) r.ids.size() > ctx) die("--kld-eval: the reference's text is past --ctx");
         std::vector<float> cand;
         kld_forward_logits(M, r.ids, chunk, cand);
         return kld_report(r, cand, kld_ref, kld_max);
     }
-    if ((int) prompt.size() + gen > ctx) die("prompt + gen past --ctx");
+    if ((long long) prompt.size() + (long long) gen > (long long) ctx) die("prompt + gen past --ctx");
     // the prompt
     std::vector<float> logits;
     double t_exp = 0;
