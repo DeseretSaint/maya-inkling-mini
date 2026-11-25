@@ -1703,6 +1703,121 @@ void test_attn_prefill() {
         }
 }
 
+// attn_prefill bitwise run to run: the same launch on the same inputs 20 times, every output memcmp'd against the first,
+// at the model's shapes (24 heads, 8 K / V heads, 8192 queries; a sliding layer's wrapped ring, a full layer's prefix
+// at 0 and at 8192; a short chunk's splits), FP8 and FP16 caches - and the old path (attn_flash_*, its bias table
+// given) the same way, as the control.  The output buffer is filled with NaN before each call, so a value the kernel
+// fails to write shows too.
+void test_attn_prefill_determinism() {
+    if (!k::attn_prefill_ok()) {
+        std::printf("skip attn_prefill determinism (not a gfx12 HIP build)\n");
+        return;
+    }
+    const int H = 24, KV = 8, D = 128, DR = 16, extent = 1024, reps = 20;
+    struct Case {
+        int T, qpos0, window, kv_cap;
+        bool split;
+        const char* name;
+    };
+    const Case cases[] = {
+        {8192, 8192, 1024, 1024 + 8192, false, "sliding, 8192 at 8192, ring wrapped"},
+        {8192, 0, 1024, 1024 + 8192, false, "sliding, 8192 at 0"},
+        {8192, 0, 1 << 30, 0, false, "full, 8192 at 0"},
+        {8192, 8192, 1 << 30, 0, false, "full, 8192 at 8192"},
+        {37, 8192, 1 << 30, 0, true, "full, 37 at 8192, splits"},
+        {37, 16000, 1024, 1024 + 8192, true, "sliding, 37 at 16000, ring, splits"},
+    };
+    for (int fp8 = 1; fp8 >= 0; --fp8)
+        for (const Case& c : cases) {
+            const int n_pos = c.qpos0 + c.T, rows = c.kv_cap > 0 ? c.kv_cap : n_pos;
+            const size_t kvn = (size_t) rows * KV * D;
+            std::vector<uint8_t> k8, v8;
+            std::vector<uint16_t> k16, v16;
+            if (fp8) {
+                k8.resize(kvn), v8.resize(kvn);
+                for (size_t i = 0; i < kvn; ++i) k8[i] = (uint8_t) (rng() & 0xDFu), v8[i] = (uint8_t) (rng() & 0xDFu);
+            } else {
+                k16.resize(kvn), v16.resize(kvn);
+                for (size_t i = 0; i < kvn; ++i) k16[i] = f2h_host(frand(1.0f)), v16[i] = f2h_host(frand(1.0f));
+            }
+            std::vector<uint16_t> q16((size_t) c.T * H * D);
+            for (auto& x : q16) x = f2h_host(frand(2.0f));
+            auto r = fvec((size_t) c.T * H * DR, 0.6f), proj = fvec((size_t) extent * DR, 1.0f);
+            auto sink = fvec((size_t) c.T * H, 3.0f);
+            std::vector<float> bias((size_t) std::min(c.T, 512) * H * extent);
+            for (size_t i = 0; i < bias.size(); ++i) bias[i] = frand(1.0f);
+            void *dk = fp8 ? (void*) dev(k8) : (void*) dev(k16), *dv = fp8 ? (void*) dev(v8) : (void*) dev(v16);
+            uint16_t* dq = dev(q16);
+            float *dr = dev(r), *dp = dev(proj), *ds = dev(sink), *db = dev(bias);
+            const size_t n_out = (size_t) c.T * H * D;
+            float* dout = dev_n<float>(n_out);
+            const size_t scr = (size_t) 64 << 20;
+            float* dscr = dev_n<float>(scr);
+            const float scale = 1.0f / std::sqrt((float) D);
+            const int ns = c.split ? std::max(2, k::attn_prefill_splits(c.T, H, std::min(c.qpos0 + c.T, c.window), 64)) : 1;
+            auto run_new = [&] {
+                if (fp8)
+                    k::attn_prefill_fp8(dq, H * D, (const uint8_t*) dk, (const uint8_t*) dv, c.kv_cap, H, KV, D, c.T,
+                                        c.qpos0, scale / 16, 1.0f / 32, dr, H * DR, DR, dp, extent, c.window, ds, dout,
+                                        H * D, dscr, scr, ns, 0);
+                else
+                    k::attn_prefill_f16(dq, H * D, (const uint16_t*) dk, (const uint16_t*) dv, c.kv_cap, H, KV, D, c.T,
+                                        c.qpos0, scale, dr, H * DR, DR, dp, extent, c.window, ds, dout, H * D, dscr,
+                                        scr, ns, 0);
+            };
+            auto run_old = [&] {
+                for (int ts = 0; ts < c.T; ts += 512) {
+                    const int Tq = std::min(512, c.T - ts);
+                    if (fp8)
+                        k::attn_flash_fp8(dq + (size_t) ts * H * D, H * D, (const uint8_t*) dk, (const uint8_t*) dv,
+                                          c.kv_cap, H, KV, D, Tq, c.qpos0 + ts, scale / 16, 1.0f / 32, db, extent,
+                                          c.window, ds + (size_t) ts * H, dout + (size_t) ts * H * D, H * D, dscr, scr,
+                                          ns, 0);
+                    else
+                        k::attn_flash_f16(dq + (size_t) ts * H * D, H * D, (const uint16_t*) dk, (const uint16_t*) dv,
+                                          c.kv_cap, H, KV, D, Tq, c.qpos0 + ts, scale, db, extent, c.window,
+                                          ds + (size_t) ts * H, dout + (size_t) ts * H * D, H * D, dscr, scr, ns, 0);
+                }
+            };
+            for (int which = 1; which >= 0; --which) {
+                std::vector<float> first, cur;
+                int bad_runs = 0;
+                size_t bad_vals = 0, at = 0;
+                double worst = 0;
+                for (int rep = 0; rep < reps; ++rep) {
+                    CU(cudaMemset(dout, 0xFF, n_out * sizeof(float)));   // (NaN)
+                    which ? run_new() : run_old();
+                    cur = host(dout, n_out);
+                    if (rep == 0) {
+                        first = cur;
+                        continue;
+                    }
+                    if (std::memcmp(cur.data(), first.data(), n_out * sizeof(float))) {
+                        ++bad_runs;
+                        for (size_t i = 0; i < n_out; ++i)
+                            if (std::memcmp(&cur[i], &first[i], sizeof(float))) {
+                                if (!bad_vals) at = i;
+                                ++bad_vals;
+                                worst = std::max(worst, (double) std::fabs(cur[i] - first[i]));
+                            }
+                    }
+                }
+                size_t nan = 0;
+                for (float x : first) nan += !std::isfinite(x);
+                char label[200];
+                std::snprintf(label, sizeof label, "determinism %s %s %s: %d runs bit-identical, no NaN", which ? "new" : "old",
+                              fp8 ? "fp8" : "f16", c.name, reps);
+                if (bad_runs || nan)
+                    std::printf("     %s: %d of %d runs differ, %zu values in all (first at query %zu head %zu dim %zu), "
+                                "max |diff| %.3g; %zu non-finite\n",
+                                label, bad_runs, reps - 1, bad_vals, at / (H * D), at / D % H, at % D, worst, nan);
+                expect_true(label, !bad_runs && !nan);
+            }
+            for (void* p : {dk, dv, (void*) dq, (void*) dr, (void*) dp, (void*) ds, (void*) db, (void*) dout, (void*) dscr})
+                cudaFree(p);
+        }
+}
+
 // ik2_kernels_test bench: attn_prefill against attn_flash (its bias table given: the GEMM before it not timed) at the
 // model's shapes - 8192 queries of 24 heads (8 K / V heads), a sliding layer's ring and window and a full layer's
 // prefix - the milliseconds a call, FP8 and FP16 caches.
@@ -2937,6 +3052,11 @@ int main(int argc, char** argv) {
         bench_attn_prefill();
         return 0;
     }
+    if (argc > 1 && !std::strcmp(argv[1], "determinism")) {   // (the prompt attention's run-to-run check alone)
+        test_attn_prefill_determinism();
+        std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
+        return g_fail ? 1 : 0;
+    }
     if (argc > 1 && !std::strcmp(argv[1], "prefill")) {   // (the prompt attention's checks alone)
         test_attn_prefill();
         std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
@@ -2969,6 +3089,7 @@ int main(int argc, char** argv) {
     test_experts_mma();
     test_q8_verify_tile();
     test_attn_prefill();   // (after the rest: its random data leaves theirs as it was)
+    test_attn_prefill_determinism();
     std::printf(g_fail ? "FAILED: %d check(s)\n" : "all passed\n", g_fail);
     return g_fail ? 1 : 0;
 }
