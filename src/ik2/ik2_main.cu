@@ -368,11 +368,11 @@ inline bool dual() { return g_ep || g_tp; }
 // they are picked, so the two GPUs' shares come out as asked; without it by a hash of the expert.
 std::vector<uint8_t> g_ep_own;
 inline int ep_owner(int l, int e) { return g_ep_own[(size_t) l * g_pop_E_ep + e]; }
-bool g_flash = true;   // IK2_FLASH=0: the prefill's attention (FP16 KV) through the logits in memory and cuBLAS, not fused
-// IK2_FA_PREFILL=1: the prompt's attention through k::attn_prefill (gfx12's matrix core, the relative bias computed in
-// the kernel, the whole chunk one launch) instead of the relative-bias GEMM + attn_flash a 512-row block at a time
-// (=2: both, compared - an instrument)
-int g_fa_prefill = 0;
+bool g_flash = true;   // IK2_FLASH=0: the prefill's attention through the logits in memory and cuBLAS, not fused
+// IK2_FA_PREFILL: the prompt's attention through k::attn_prefill (gfx12's matrix core, the relative bias computed in
+// the kernel, the whole chunk one launch; the default where the device has it), =0 the relative-bias GEMM + attn_flash
+// a 512-row block at a time as before, =2 both on the same inputs, compared (an instrument)
+int g_fa_prefill = 1;
 int g_n_sm = 0;
 bool g_group = true;   // IK2_GROUP=0: 2 .. 8 tokens' experts a slot at a time, their attention a head at a time
 bool g_group_exp = true, g_group_attn = true;   // (IK2_GROUP=1: the experts grouped only, 2: the attention only)
@@ -1711,15 +1711,15 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                                   c.d_rel, Ly.rel_proj, extent, window, sink_p + (size_t) ts * c.H, g_s);
             }
         };
-        // the prompt's fused attention: attn_prefill (IK2_FA_PREFILL; a ring must hold every key of a 64-query block's,
+        // the prompt's fused attention: attn_prefill (IK2_FA_PREFILL; a ring must hold every key of a 128-query block's,
         // as pos % kv_cap is one subtraction there), else the relative-bias GEMM + attn_flash a 512-row block at a time
-        const bool fa_new = g_fa_prefill && c.D == 128 && c.d_rel == 16 && k::attn_prefill_ok() &&
-                            (attn_kv_cap == 0 || attn_kv_cap >= std::min(T, 64) + c.window - 1);
+        const bool fa_new = g_fa_prefill && g_flash && c.D == 128 && c.d_rel == 16 && k::attn_prefill_ok() &&
+                            (attn_kv_cap == 0 || attn_kv_cap >= std::min(T, 128) + c.window - 1);
         const bool fa_old = g_flash && c.D == 128 && W.relb && extent <= W.relb_ext;
         if (fa_new || fa_old)
             if (!g_n_sm) CU(cudaDeviceGetAttribute(&g_n_sm, cudaDevAttrMultiProcessorCount, Ly.dev));
         auto run_new = [&] {
-            const int k_lo = Ly.sliding ? std::max(0, pos0 + T - 64 - c.window + 1) : 0;   // (the last block's keys)
+            const int k_lo = Ly.sliding ? std::max(0, pos0 + T - 128 - c.window + 1) : 0;   // (the last block's keys)
             const int ns = k::attn_prefill_splits(T, c.H, pos0 + T - k_lo, g_n_sm);
             if (g_kv_fp8)
                 k::attn_prefill_fp8(W.x16, HD, Ly.kc8, Ly.vc8, attn_kv_cap, c.H, c.KV, c.D, T, pos0, qk_scale * k_inv,

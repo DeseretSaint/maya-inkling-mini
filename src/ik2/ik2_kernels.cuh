@@ -100,8 +100,9 @@ int attn_flash_splits(int Tq, int H, int nk, int n_sm);
 /// The prompt's attention on gfx12's matrix core (IK2_FA_PREFILL), D = 128, d_rel = 16: attn_flash_f16 / _fp8's
 /// inputs and output, the relative bias computed in the kernel from r and proj (as attn_probs: r [Tq] rows of r_ld,
 /// head h's d_rel values at h * d_rel; proj [extent][d_rel]) instead of read from a table.  Any Tq (one launch);
-/// a ring (kv_cap > 0) must hold every key of the chunk's queries (kv_cap >= window + Tq).  scratch: extent * 16
-/// floats (proj as FP16) + n_split * Tq * H * (D + 2) floats for the splits (fewer splits if it holds fewer).
+/// a ring (kv_cap > 0) must hold every key of a 128-query block's (kv_cap >= min(Tq, 128) + window - 1: the
+/// engine's window + chunk does).  scratch: (extent + 2) * 16 floats (proj as FP16) + n_split * Tq * H * (D + 2)
+/// floats for the splits (fewer splits if it holds fewer).
 /// attn_prefill_ok: the device can run it (a HIP build on gfx12).
 bool attn_prefill_ok();
 void attn_prefill_f16(const uint16_t* q16, int q_ld, const uint16_t* kc, const uint16_t* vc, int kv_cap, int H, int KV,

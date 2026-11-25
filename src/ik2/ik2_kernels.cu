@@ -5665,30 +5665,33 @@ experts_block_down_q8_kernel(const uint8_t* const* __restrict__ blob, const int*
 
 #if defined(__HIP_PLATFORM_AMD__)
 // ---- the prompt's attention on gfx12 (IK2_FA_PREFILL=1): FlashAttention-2 on the WMMA core, both products
-// transposed so that a lane owns one query.  A workgroup: 64 queries (4 waves x 16) of one head; the keys in tiles
-// of 64, each tile's K (FP16, [key][dim]) and V^T (FP16, [dim][key]) in shared memory once for the four waves
-// (an FP8 cache's bytes made FP16 by the hardware's conversion - exact - as they are stored), the next tile's
-// bytes loaded into registers while this one is computed (K's during Q K^T, V's during P V).
-//   S^T = K Q^T      A = K rows (keys) from shared memory, B = Q^T (the wave's 16 queries, registers, loaded once):
-//                    lane l gets query l % 16's logits at keys 8 (l >> 4) + i of each 16-key block.
+// transposed so that a lane owns one query.  A workgroup: 128 queries (8 waves x 16) of one head; the keys in tiles
+// of 32, each tile's K (FP16, [key][dim]) and V^T (FP16, [dim][key]) in shared memory once for the eight waves (an
+// FP8 cache's bytes made FP16 by the hardware's conversion - exact - as they are stored).  The tile is staged in two
+// halves around the compute so that one buffer of each is enough: K(t + 1) is stored once every wave is past its
+// Q K^T of tile t, V(t + 1) once every wave is past its P V; each half's bytes are loaded into registers a whole
+// iteration ahead.
+//   S^T = K Q^T      A = K rows (keys) from shared memory, B = Q^T (the wave's 16 queries): lane l gets query
+//                    l % 16's logits at keys 8 (l >> 4) + i of each 16-key block.
 //   O^T += V^T P^T   A = V^T rows (dims), B = P^T - exactly the lane's own probabilities of the block, so P never
 //                    leaves the registers;  O^T: lane l holds query l % 16's dims 8 (l >> 4) + i of each 16-dim block.
-// The online softmax is a lane's own 32 logits a tile and one cross-half exchange; the output's rescale is a lane's
-// own scalar.  The relative bias r[q] . proj[dist] (d_rel = 16) is computed here, not read from a table: a wave's
-// 16 x 64 (query, key) pairs of a tile need 79 distances, i.e. five 16 x 16 x 16 products D[dist][query] =
-// proj . r^T, each as three FP16 products (hi . hi + hi . lo + lo . hi of the F32 values split in two halves: ~F32
-// accuracy), the tile's 128 proj rows (hi, lo) staged in shared memory with K and V.  The products go to a per-wave
-// table skewed by the query (row q at column dist - q), so each lane reads its 8 keys of a block back as two aligned
-// 16-byte loads.  The causal / window mask, the sink, and with splits attn_flash_combine, as attn_flash's.
+// The online softmax is a lane's own 16 logits a tile and one cross-half exchange; the output's rescale a lane's own
+// scalar (skipped when no lane's maximum moved).  The relative bias r[q] . proj[dist] (d_rel = 16) is computed here,
+// not read from a table: a wave's 16 x 32 (query, key) pairs of a tile need 47 distances, i.e. three 16 x 16 x 16
+// products D[dist][query] = proj . r^T (one of them the tile before's), each as three FP16 products (hi . hi +
+// hi . lo + lo . hi of the F32 values split in two halves: ~F32 accuracy), the tile's 160 proj rows (hi, lo) staged
+// in shared memory with V.  The products go to a per-wave table skewed by the query (row q at column dist - q), so
+// each lane reads its 8 keys of a block back as two aligned 16-byte loads.  The causal / window mask, the sink, and
+// with splits attn_flash_combine, as attn_flash's.
 namespace pf {
-constexpr int BQ = 64, BK = 64, NW = 4, D = 128;
+constexpr int BQ = 128, BK = 32, NW = 8, NT = NW * 32, D = 128;
 constexpr int LDK = D + 8;    // K tile [BK][LDK] halves (row pad: a 16-byte load a lane, conflict-free)
 constexpr int LDV = BK + 8;   // V^T tile [D][LDV] halves
-constexpr int NP = BQ + BK;   // proj rows a tile: distances [c - 63, c + 64], c = the block's first query - kt
+constexpr int NP = BQ + BK;   // proj rows a tile: distances c - 31 .. c + 128, c = the block's first query - kt
 constexpr int LDP = 40;       // a proj row [hi 16][lo 16] + pad, halves
-constexpr int LDB = BK + 4;   // a wave's bias table [16][LDB] floats (columns 64..67: the discarded writes)
-constexpr int kSmem = BK * LDK * 2 + D * LDV * 2 + NP * LDP * 2 + NW * 16 * LDB * 4;   // 63,488 bytes
-constexpr int kProjPad = 128;   // proj16's zero rows before distance 0 (and one after extent - 1)
+constexpr int LDB = BK + 4;   // a wave's bias table [16][LDB] floats
+constexpr int kPChunks = NP * 4;   // 16-byte chunks of a tile's proj rows
+constexpr int kSmem = BK * LDK * 2 + D * LDV * 2 + NP * LDP * 2 + NW * 16 * LDB * 4;   // 50,176 bytes
 }   // namespace pf
 #if defined(__gfx1200__) || defined(__gfx1201__)
 typedef _Float16 pf_h8 __attribute__((ext_vector_type(8)));
@@ -5711,140 +5714,148 @@ __device__ __forceinline__ float pf_xhalf(float v) {   // lane l's value at lane
     return __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(__builtin_bit_cast(int, v), __builtin_bit_cast(int, v),
                                                                   0x76543210, (int) 0xfedcba98u, false, false));
 }
+// the workgroup's barrier for the shared-memory tiles alone (__syncthreads also invalidates the vector cache, which
+// would drop the next tile's Q and K / V lines)
+__device__ __forceinline__ void pf_barrier() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+}
 __device__ __forceinline__ void pf_wave_sync() {
     __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
     __builtin_amdgcn_wave_barrier();
     __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
 }
 #endif
-// a tile's bytes as loaded: K (FP8: 64 B a thread; FP16: 128 B), V (the same), the tile's proj rows (64 B)
+// a tile's bytes as loaded: K (FP8: 2 x 8 B a thread; FP16: 2 x 16 B), V (FP8: 4 keys x 4 B; FP16: 4 x 8 B), the tile's
+// proj rows (up to 3 x 16 B)
 template <bool F8>
 struct PfRegs;
 template <>
 struct PfRegs<true> {
-    uint4 k[4];
-    uint2 v[8];
-    uint4 p[4];
+    uint2 k[2];
+    uint32_t v[4];
+    uint4 p[3];
 };
+typedef unsigned pf_u4 __attribute__((ext_vector_type(4)));   // (HIP's uint4 members kept FP16's K in scratch)
 template <>
 struct PfRegs<false> {
-    uint4 k[8];
-    uint4 v[8];
-    uint4 p[4];
+    pf_u4 k[2];
+    uint2 v[4];
+    uint4 p[3];
 };
 // a key's row of the cache (an offset in elements): kp in [k_lo, k_hi), clamped to k_hi - 1 (the tile's rows past
 // the block's last key: real keys, masked).  A ring holds every key of [k_lo, k_hi) (kv_cap >= the window + the
 // chunk), so pos % kv_cap is one conditional subtraction from k_lo's slot.
 __device__ __forceinline__ uint32_t pf_row(int kp, int k_hi, int k_lo, int ring0, int kv_cap, int KD) {
     kp = min(kp, k_hi - 1);
-    if (kv_cap <= 0) return (uint32_t) kp * (uint32_t) KD;
-    int pr = kp - k_lo + ring0;
-    if (pr >= kv_cap) pr -= kv_cap;
-    return (uint32_t) pr * (uint32_t) KD;
+    int pr = kp;
+    if (kv_cap > 0) {
+        pr = kp - k_lo + ring0;
+        pr = pr >= kv_cap ? pr - kv_cap : pr;
+    }
+    return __umul24((uint32_t) pr, (uint32_t) KD);
 }
-// K: thread t's chunks c = it * 128 + t (16 bytes of a key's row: 8 chunks a row for FP8, 16 for FP16).  proj: thread
-// t the tile's distance c - 63 + t, when the tile needs any.
+// K: FP8 thread t the bytes 8 (t & 7) .. + 7 and 64 + 8 (t & 7) .. + 7 of key t >> 3; FP16 the 16 bytes (c & 15) of
+// key c >> 4, c = t, t + 256
 template <bool F8>
 __device__ __forceinline__ void pf_fetch_k(PfRegs<F8>& R, const void* kc, int KD, int kt, int k_hi, int k_lo,
-                                           int ring0, int kv_cap, const uint16_t* proj16, int dist, bool near,
-                                           int extent, int tid) {
+                                           int ring0, int kv_cap, int tid) {
     if constexpr (F8) {
-        const uint8_t* kb = (const uint8_t*) kc;
-#pragma unroll
-        for (int it = 0; it < 4; ++it) {
-            const int c = it * 128 + tid;
-            R.k[it] = *(const uint4*) (kb + pf_row(kt + (c >> 3), k_hi, k_lo, ring0, kv_cap, KD) + (c & 7) * 16);
-        }
+        const uint8_t* kr = (const uint8_t*) kc + pf_row(kt + (tid >> 3), k_hi, k_lo, ring0, kv_cap, KD) + (tid & 7) * 8;
+        R.k[0] = *(const uint2*) kr, R.k[1] = *(const uint2*) (kr + 64);
     } else {
-        const uint16_t* kb = (const uint16_t*) kc;
-#pragma unroll
-        for (int it = 0; it < 8; ++it) {
-            const int c = it * 128 + tid;
-            R.k[it] = *(const uint4*) (kb + pf_row(kt + (c >> 4), k_hi, k_lo, ring0, kv_cap, KD) + (c & 15) * 8);
-        }
-    }
-    if (near) {   // (proj16's rows: kProjPad zero rows, extent rows, a zero row - distances clamped to [-128, extent])
-        const uint4* pp = (const uint4*) (proj16 + (size_t) (pf::kProjPad + min(dist, extent)) * 32);
-#pragma unroll
-        for (int i = 0; i < 4; ++i) R.p[i] = pp[i];
+        const uint16_t* kb = (const uint16_t*) kc + (tid & 15) * 8;
+        R.k[0] = *(const pf_u4*) (kb + pf_row(kt + (tid >> 4), k_hi, k_lo, ring0, kv_cap, KD));
+        R.k[1] = *(const pf_u4*) (kb + pf_row(kt + 16 + (tid >> 4), k_hi, k_lo, ring0, kv_cap, KD));
     }
 }
-// V: thread t the 8 keys 8 (t >> 4) .. + 7 at the 8 dims 8 (t & 15) .. + 7 (the transpose's block)
+// V: thread t the 4 keys 4 (t & 7) .. + 3 at the 4 dims 4 (t >> 3) .. + 3 (the transpose's block: a store's lanes write
+// two rows' 64 bytes, conflict-free; the loads 8 keys' 16 bytes an instruction); proj: the 16-byte
+// chunks t, t + 256, t + 512 (< 640) of the tile's rows, row i the distance c - 31 + i (clamped: the zero rows of
+// proj16 before distance 0 and at extent), when the tile needs any
 template <bool F8>
-__device__ __forceinline__ void pf_fetch_v(PfRegs<F8>& R, const void* vc, int KD, int kt, int k_hi, int k_lo,
-                                           int ring0, int kv_cap, int tid) {
-    const int col = (tid & 15) * 8;
+__device__ __forceinline__ void pf_fetch_vp(PfRegs<F8>& R, const void* vc, int KD, int kt, int k_hi, int k_lo,
+                                            int ring0, int kv_cap, const uint16_t* proj16, int c, bool near,
+                                            int extent, int tid) {
+    const int col = (tid >> 3) * 4;
 #pragma unroll
-    for (int j = 0; j < 8; ++j) {
-        const uint32_t off = pf_row(kt + (tid >> 4) * 8 + j, k_hi, k_lo, ring0, kv_cap, KD) + col;
-        if constexpr (F8) R.v[j] = *(const uint2*) ((const uint8_t*) vc + off);
-        else R.v[j] = *(const uint4*) ((const uint16_t*) vc + off);
+    for (int j = 0; j < 4; ++j) {
+        const uint32_t off = pf_row(kt + (tid & 7) * 4 + j, k_hi, k_lo, ring0, kv_cap, KD) + col;
+        if constexpr (F8) R.v[j] = *(const uint32_t*) ((const uint8_t*) vc + off);
+        else R.v[j] = *(const uint2*) ((const uint16_t*) vc + off);
+    }
+    if (near) {
+#pragma unroll
+        for (int j = 0; j < 3; ++j) {
+            const int idx = j * pf::NT + tid;
+            if (j < 2 || idx < pf::kPChunks) {
+                const int dist = c - (pf::BK - 1) + (idx >> 2);
+                const int row = max(-1, min(dist, extent)) + 1;
+                R.p[j] = *(const uint4*) (proj16 + (size_t) row * 32 + (idx & 3) * 8);
+            }
+        }
     }
 }
 #if defined(__gfx1200__) || defined(__gfx1201__)
 template <bool F8>
-__device__ __forceinline__ void pf_store(const PfRegs<F8>& R, uint16_t* Ks, uint16_t* Vt, uint16_t* Ps, bool near,
-                                         int tid) {
+__device__ __forceinline__ void pf_store_k(const PfRegs<F8>& R, uint16_t* Ks, int tid) {
     using namespace pf;
-    const int kg = tid >> 4, dg = tid & 15;
-    if constexpr (F8) {
+    if constexpr (F8) {   // (a row's eight lanes store 128 contiguous bytes an instruction: no bank conflicts)
+        uint16_t* dst = Ks + (tid >> 3) * LDK + (tid & 7) * 8;
 #pragma unroll
-        for (int it = 0; it < 4; ++it) {
-            const int c = it * 128 + tid, row = c >> 3, col = (c & 7) * 16;
-            float f[16];
-            pf_e4m3x4(R.k[it].x, f), pf_e4m3x4(R.k[it].y, f + 4), pf_e4m3x4(R.k[it].z, f + 8),
-                pf_e4m3x4(R.k[it].w, f + 12);
-            uint16_t* dst = Ks + row * LDK + col;
-            *(uint4*) dst = make_uint4(pf_pk_exact(f[0], f[1]), pf_pk_exact(f[2], f[3]), pf_pk_exact(f[4], f[5]),
-                                       pf_pk_exact(f[6], f[7]));
-            *(uint4*) (dst + 8) = make_uint4(pf_pk_exact(f[8], f[9]), pf_pk_exact(f[10], f[11]),
-                                             pf_pk_exact(f[12], f[13]), pf_pk_exact(f[14], f[15]));
-        }
-#pragma unroll
-        for (int hh = 0; hh < 2; ++hh) {   // (dims 0..3 of the block, then 4..7: 32 values live, not 64)
-            float f[8][4];                 // [key][dim]
-#pragma unroll
-            for (int j = 0; j < 8; ++j) pf_e4m3x4(hh ? R.v[j].y : R.v[j].x, f[j]);
-#pragma unroll
-            for (int e = 0; e < 4; ++e)
-                *(uint4*) (Vt + (dg * 8 + 4 * hh + e) * LDV + kg * 8) =
-                    make_uint4(pf_pk_exact(f[0][e], f[1][e]), pf_pk_exact(f[2][e], f[3][e]),
-                               pf_pk_exact(f[4][e], f[5][e]), pf_pk_exact(f[6][e], f[7][e]));
+        for (int i = 0; i < 2; ++i) {
+            float f[8];
+            pf_e4m3x4(R.k[i].x, f), pf_e4m3x4(R.k[i].y, f + 4);
+            *(uint4*) (dst + 64 * i) = make_uint4(pf_pk_exact(f[0], f[1]), pf_pk_exact(f[2], f[3]),
+                                                  pf_pk_exact(f[4], f[5]), pf_pk_exact(f[6], f[7]));
         }
     } else {
+        uint16_t* dst = Ks + (tid >> 4) * LDK + (tid & 15) * 8;
+        *(pf_u4*) dst = R.k[0];
+        *(pf_u4*) (dst + 16 * LDK) = R.k[1];
+    }
+}
+template <bool F8>
+__device__ __forceinline__ void pf_store_vp(const PfRegs<F8>& R, uint16_t* Vt, uint16_t* Ps, bool near, int tid) {
+    using namespace pf;
+    const int kg = tid & 7, dg = tid >> 3;
+    uint16_t* vd = Vt + dg * 4 * LDV + kg * 4;   // dim 4 dg + e, keys 4 kg .. + 3 at vd + e * LDV
+    if constexpr (F8) {
+        float f[4][4];   // [key][dim]
 #pragma unroll
-        for (int it = 0; it < 8; ++it) {
-            const int c = it * 128 + tid, row = c >> 4, col = (c & 15) * 8;
-            *(uint4*) (Ks + row * LDK + col) = R.k[it];
-        }
-        // dim 2p of key j is the low half of R.v[j]'s word p, dim 2p + 1 the high half
+        for (int j = 0; j < 4; ++j) pf_e4m3x4(R.v[j], f[j]);
 #pragma unroll
-        for (int p = 0; p < 4; ++p) {
-            uint32_t w[8];
+        for (int e = 0; e < 4; ++e)
+            *(uint2*) (vd + e * LDV) = make_uint2(pf_pk_exact(f[0][e], f[1][e]), pf_pk_exact(f[2][e], f[3][e]));
+    } else {
+        // dim 2p of key j: the low half of R.v[j]'s word p; dim 2p + 1 the high half
 #pragma unroll
-            for (int j = 0; j < 8; ++j) w[j] = p == 0 ? R.v[j].x : p == 1 ? R.v[j].y : p == 2 ? R.v[j].z : R.v[j].w;
-            *(uint4*) (Vt + (dg * 8 + 2 * p) * LDV + kg * 8) =
-                make_uint4(__builtin_amdgcn_perm(w[1], w[0], 0x05040100u), __builtin_amdgcn_perm(w[3], w[2], 0x05040100u),
-                           __builtin_amdgcn_perm(w[5], w[4], 0x05040100u), __builtin_amdgcn_perm(w[7], w[6], 0x05040100u));
-            *(uint4*) (Vt + (dg * 8 + 2 * p + 1) * LDV + kg * 8) =
-                make_uint4(__builtin_amdgcn_perm(w[1], w[0], 0x07060302u), __builtin_amdgcn_perm(w[3], w[2], 0x07060302u),
-                           __builtin_amdgcn_perm(w[5], w[4], 0x07060302u), __builtin_amdgcn_perm(w[7], w[6], 0x07060302u));
+        for (int p = 0; p < 2; ++p) {
+            const uint32_t w0 = p ? R.v[0].y : R.v[0].x, w1 = p ? R.v[1].y : R.v[1].x;
+            const uint32_t w2 = p ? R.v[2].y : R.v[2].x, w3 = p ? R.v[3].y : R.v[3].x;
+            *(uint2*) (vd + 2 * p * LDV) =
+                make_uint2(__builtin_amdgcn_perm(w1, w0, 0x05040100u), __builtin_amdgcn_perm(w3, w2, 0x05040100u));
+            *(uint2*) (vd + (2 * p + 1) * LDV) =
+                make_uint2(__builtin_amdgcn_perm(w1, w0, 0x07060302u), __builtin_amdgcn_perm(w3, w2, 0x07060302u));
         }
     }
     if (near) {
-        uint16_t* pd = Ps + tid * LDP;
 #pragma unroll
-        for (int i = 0; i < 4; ++i) *(uint4*) (pd + 8 * i) = R.p[i];
+        for (int j = 0; j < 3; ++j) {
+            const int idx = j * NT + tid;
+            if (j < 2 || idx < kPChunks) *(uint4*) (Ps + (idx >> 2) * LDP + (idx & 3) * 8) = R.p[j];
+        }
     }
 }
 #endif
 
-// proj [extent][16] F32 -> rows [kProjPad + extent + 1][32] FP16: kProjPad zero rows, then each distance's 16 high
-// halves and 16 low (v - hi), then a zero row
+// proj [extent][16] F32 -> rows [extent + 2][32] FP16: a zero row (distances < 0), each distance's 16 high halves and
+// 16 low (v - hi), a zero row (distances >= extent)
 __global__ void pf_proj16_kernel(const float* __restrict__ proj, int extent, uint16_t* __restrict__ out) {
     const int i = blockIdx.x * blockDim.x + threadIdx.x, row = i >> 4, k = i & 15;
-    if (row >= pf::kProjPad + extent + 1) return;
-    const int dist = row - pf::kProjPad;
+    if (row >= extent + 2) return;
+    const int dist = row - 1;
     const float v = dist >= 0 && dist < extent ? proj[(size_t) dist * 16 + k] : 0.0f;
     const uint16_t hi = f2h(v);
     out[(size_t) row * 32 + k] = hi;
@@ -5856,7 +5867,7 @@ __global__ void pf_proj16_kernel(const float* __restrict__ proj, int extent, uin
 // sink [Tq][H]; SPLIT: the split's partials (o_part / ml_part as attn_flash_f16_kernel's), else out [Tq] rows of
 // o_ld = O / den * out_scale.
 template <bool F8, bool SPLIT>
-__global__ void __launch_bounds__(128)
+__global__ void __launch_bounds__(pf::NT)
 attn_prefill_kernel(const uint16_t* __restrict__ q16, int q_ld, const void* __restrict__ kc,
                     const void* __restrict__ vc, int kv_cap, int H, int KV, int Tq, int qpos0, float sc,
                     float out_scale, const float* __restrict__ r, int r_ld, const uint16_t* __restrict__ proj16,
@@ -5886,7 +5897,7 @@ attn_prefill_kernel(const uint16_t* __restrict__ q16, int q_ld, const void* __re
     const bool qok = iq < Tq, w_on = wi < Tq, w_rows = wi + 15 < Tq;
     const int qw = qpos0 + wi;                                      // the wave's first query's position
     const int kw_hi = qpos0 + min(wi + 15, Tq - 1) + 1, kw_lo = qw - window + 1;   // its keys [kw_lo, kw_hi)
-    const int cb = qpos0 + i0 - (BK - 1) + tid;   // - kt: the distance of the proj row this thread stages
+    const int cq = qpos0 + i0;   // - kt: the block's first query's distance to a tile's first key
 
     // Q^T as the B operand: query qi's dims 16 ds + 8 hf .. + 7 (re-read each tile, from the cache: its 32 registers
     // are then free outside Q K^T; a row past Tq reads row 0, masked)
@@ -5916,62 +5927,71 @@ attn_prefill_kernel(const uint16_t* __restrict__ q16, int q_ld, const void* __re
     for (int j = 0; j < D / 16; ++j)
 #pragma unroll
         for (int e = 0; e < 8; ++e) o[j][e] = 0.0f;
+    pf_f8 carry;   // the bias block 0 of the wave's tile before: this tile's block 2 (the same distances)
+#pragma unroll
+    for (int e = 0; e < 8; ++e) carry[e] = 0.0f;
+    bool carry_ok = false;
 
     PfRegs<F8> R;
     // a tile needs the bias if its nearest pair (the block's first query, the tile's last key) is within the extent
-    auto tile_near = [&](int kt) { return qpos0 + i0 - (kt + BK - 1) < extent; };
-    if (t0 < t1) {
-        const int kt = k_lo + t0 * BK;
-        pf_fetch_k<F8>(R, kc, KD, kt, k_hi, k_lo, ring0, kv_cap, proj16, cb - kt, tile_near(kt), extent, tid);
-        pf_fetch_v<F8>(R, vc, KD, kt, k_hi, k_lo, ring0, kv_cap, tid);
-    }
-    for (int t = t0; t < t1; ++t) {
-        const int kt = k_lo + t * BK;
-        const bool near_b = tile_near(kt);
-        uint4 qf[D / 16];
-        {
-            int z = 0;
-            asm volatile("" : "+s"(z));   // (an opaque zero: keeps the loads in the loop)
-#pragma unroll
-            for (int ds = 0; ds < D / 16; ++ds) qf[ds] = qrow[2 * ds + z];
+    auto tile_near = [&](int kt) { return cq - (kt + BK - 1) < extent; };
+    auto kt_of = [&](int t) { return k_lo + t * BK; };
+    if (t0 < t1) {   // tile t0 staged, t0 + 1's bytes in the registers
+        pf_fetch_k<F8>(R, kc, KD, kt_of(t0), k_hi, k_lo, ring0, kv_cap, tid);
+        pf_fetch_vp<F8>(R, vc, KD, kt_of(t0), k_hi, k_lo, ring0, kv_cap, proj16, cq - kt_of(t0), tile_near(kt_of(t0)),
+                        extent, tid);
+        pf_store_k<F8>(R, Ks, tid);
+        pf_store_vp<F8>(R, Vt, Ps, tile_near(kt_of(t0)), tid);
+        if (t0 + 1 < t1) {
+            const int kt = kt_of(t0 + 1);
+            pf_fetch_k<F8>(R, kc, KD, kt, k_hi, k_lo, ring0, kv_cap, tid);
+            pf_fetch_vp<F8>(R, vc, KD, kt, k_hi, k_lo, ring0, kv_cap, proj16, cq - kt, tile_near(kt), extent, tid);
         }
-        __syncthreads();   // (every wave done with the tile before's)
-        pf_store<F8>(R, Ks, Vt, Ps, near_b, tid);
-        __syncthreads();
-        const bool more = t + 1 < t1;
-        if (more)
-            pf_fetch_k<F8>(R, kc, KD, kt + BK, k_hi, k_lo, ring0, kv_cap, proj16, cb - kt - BK, tile_near(kt + BK),
-                           extent, tid);
+    }
+    uint4 qf[D / 16];   // (the tile's Q, loaded at the end of the iteration before: in flight across its barrier)
+    auto load_q = [&] {
+        int z = 0;
+        asm volatile("" : "+s"(z));   // (an opaque zero: keeps the loads in the loop)
+#pragma unroll
+        for (int ds = 0; ds < D / 16; ++ds) qf[ds] = qrow[2 * ds + z];
+    };
+    load_q();
+    pf_barrier();
+    for (int t = t0; t < t1; ++t) {
+        const int kt = kt_of(t);
         const bool on = w_on && kt < kw_hi && kt + BK - 1 >= kw_lo;   // (wave-uniform: a key of the tile for its rows)
+        const int c0 = qw - kt;                                      // dist(query qi, key kj) = c0 + qi - kj
+        // S^T = K Q^T: dims outer (two independent accumulators)
+        pf_f8 s[BK / 16];
+#pragma unroll
+        for (int kb = 0; kb < BK / 16; ++kb)
+#pragma unroll
+            for (int e = 0; e < 8; ++e) s[kb][e] = 0.0f;
         if (on) {
-            const int c0 = qw - kt;                     // dist(query qi, key kj) = c0 + qi - kj
-            const bool near = c0 - (BK - 1) < extent;   // some pair within the bias's extent
-            // S^T = K Q^T: dims outer (four independent accumulators), the next step's K rows loaded ahead
-            pf_f8 s[BK / 16];
+            // (K's fragments a step ahead: the step's two loads in flight while the step before's products run)
+            const uint16_t* kr = Ks + qi * LDK + 8 * hf;
+            uint4 ka[BK / 16], kn[BK / 16];
 #pragma unroll
-            for (int kb = 0; kb < BK / 16; ++kb)
+            for (int kb = 0; kb < BK / 16; ++kb) ka[kb] = *(const uint4*) (kr + kb * 16 * LDK);
 #pragma unroll
-                for (int e = 0; e < 8; ++e) s[kb][e] = 0.0f;
-            {
-                const uint16_t* kr = Ks + qi * LDK + 8 * hf;
-                uint4 ka[BK / 16], kn[BK / 16];
+            for (int ds = 0; ds < D / 16; ++ds) {
+                if (ds + 1 < D / 16)
 #pragma unroll
-                for (int kb = 0; kb < BK / 16; ++kb) ka[kb] = *(const uint4*) (kr + kb * 16 * LDK);
+                    for (int kb = 0; kb < BK / 16; ++kb) kn[kb] = *(const uint4*) (kr + kb * 16 * LDK + 16 * (ds + 1));
 #pragma unroll
-                for (int ds = 0; ds < D / 16; ++ds) {
-                    if (ds + 1 < D / 16)
+                for (int kb = 0; kb < BK / 16; ++kb) s[kb] = pf_wmma(ka[kb], qf[ds], s[kb]);
 #pragma unroll
-                        for (int kb = 0; kb < BK / 16; ++kb)
-                            kn[kb] = *(const uint4*) (kr + kb * 16 * LDK + 16 * (ds + 1));
-#pragma unroll
-                    for (int kb = 0; kb < BK / 16; ++kb) s[kb] = pf_wmma(ka[kb], qf[ds], s[kb]);
-#pragma unroll
-                    for (int kb = 0; kb < BK / 16; ++kb) ka[kb] = kn[kb];
-                }
+                for (int kb = 0; kb < BK / 16; ++kb) ka[kb] = kn[kb];
             }
+        }
+        pf_barrier();   // (every wave past its Q K^T: K's buffer free)
+        if (t + 1 < t1) pf_store_k<F8>(R, Ks, tid);
+        if (t + 2 < t1) pf_fetch_k<F8>(R, kc, KD, kt_of(t + 2), k_hi, k_lo, ring0, kv_cap, tid);
+        if (on) {
+            const bool near = c0 - (BK - 1) < extent;   // some pair within the bias's extent
             // the logits in log2 units: scale, + bias, mask
             if (near) {
-                // block b's product: D[dist index 16 b + m][query] for the distances c0 - 63 + 16 b + m
+                // block b's product: D[dist index 16 b + m][query], the distances c0 - 31 + 16 b + m
                 const uint16_t* prow = Ps + (16 * wave + qi) * LDP + 8 * hf;
                 auto blk = [&](int b) {
                     pf_f8 a;
@@ -5988,23 +6008,21 @@ attn_prefill_kernel(const uint16_t* __restrict__ q16, int q_ld, const void* __re
                     return a;
                 };
                 // a[e] of block b: distance index dd = 16 b + 8 hf + e of query qi -> the table's column dd - qi,
-                // kept if in [0, 64): blocks 1..3 entirely; of blocks 0 and 4 exactly one for each e (the column
-                // (8 hf + e - qi) mod 64)
+                // kept if in [0, 32): block 1 entirely; of blocks 0 and 2 exactly one for each e (the column
+                // (8 hf + e - qi) mod 32)
+                const pf_f8 a0 = blk(0), a2 = carry_ok ? carry : blk(2);
+#pragma unroll
+                for (int e = 0; e < 8; ++e) bt[(8 * hf + e - qi) & (BK - 1)] = 8 * hf + e >= qi ? a0[e] : a2[e];
+                carry = a0, carry_ok = true;
                 {
-                    const pf_f8 a0 = blk(0), a4 = blk(4);
+                    const pf_f8 a1 = blk(1);
+                    float* bw = bt + 16 + 8 * hf - qi;
 #pragma unroll
-                    for (int e = 0; e < 8; ++e) bt[(8 * hf + e - qi) & (BK - 1)] = 8 * hf + e >= qi ? a0[e] : a4[e];
-                }
-                float* bw = bt + 8 * hf - qi;
-#pragma unroll
-                for (int b = 1; b < 4; ++b) {
-                    const pf_f8 a = blk(b);
-#pragma unroll
-                    for (int e = 0; e < 8; ++e) bw[16 * b + e] = a[e];
+                    for (int e = 0; e < 8; ++e) bw[e] = a1[e];
                 }
                 pf_wave_sync();
 #pragma unroll
-                for (int kb = 0; kb < BK / 16; ++kb) {   // key kj = 16 kb + 8 hf + e at column 63 - kj
+                for (int kb = 0; kb < BK / 16; ++kb) {   // key kj = 16 kb + 8 hf + e at column 31 - kj
                     const int x0 = BK - 8 - 16 * kb - 8 * hf;
                     const float4 u = *(const float4*) (bt + x0), v = *(const float4*) (bt + x0 + 4);
                     const float bv[8] = {v.w, v.z, v.y, v.x, u.w, u.z, u.y, u.x};
@@ -6012,6 +6030,7 @@ attn_prefill_kernel(const uint16_t* __restrict__ q16, int q_ld, const void* __re
                     for (int e = 0; e < 8; ++e) s[kb][e] = fmaf(s[kb][e], sc, bv[e]);
                 }
             } else {
+                carry_ok = false;
 #pragma unroll
                 for (int kb = 0; kb < BK / 16; ++kb)
 #pragma unroll
@@ -6034,6 +6053,7 @@ attn_prefill_kernel(const uint16_t* __restrict__ q16, int q_ld, const void* __re
                 for (int e = 0; e < 8; ++e) mx = fmaxf(mx, s[kb][e]);
             mx = fmaxf(mx, pf_xhalf(mx));
             const float m_new = fmaxf(m_run, mx);
+            const bool moved = m_new > m_run;
             const float alpha = __builtin_amdgcn_exp2f(m_run - m_new);
             m_run = m_new;
             float ls = 0.0f;
@@ -6047,30 +6067,41 @@ attn_prefill_kernel(const uint16_t* __restrict__ q16, int q_ld, const void* __re
                                     f2_to_u32(p[6], p[7]));
             }
             l_run = l_run * alpha + ls;
+            if (__builtin_amdgcn_ballot_w32(moved)) {   // (some lane's maximum moved: the rescale; alpha = 1 elsewhere)
 #pragma unroll
-            for (int j = 0; j < D / 16; ++j)
+                for (int j = 0; j < D / 16; ++j)
 #pragma unroll
-                for (int e = 0; e < 8; ++e) o[j][e] *= alpha;
-            // (the next tile's V, issued here: before Q K^T its registers would be live through it)
-            asm volatile("" ::: "memory");
-            if (more) pf_fetch_v<F8>(R, vc, KD, kt + BK, k_hi, k_lo, ring0, kv_cap, tid);
-            // O^T += V^T P^T: four dim blocks at a time (independent accumulators), keys inner
+                    for (int e = 0; e < 8; ++e) o[j][e] *= alpha;
+            }
+            // O^T += V^T P^T: dims outer, the two key blocks inner
+            {
+                const uint16_t* vr = Vt + qi * LDV + 8 * hf;
+                uint4 va[BK / 16], vn[BK / 16];
 #pragma unroll
-            for (int jg = 0; jg < D / 16; jg += 4) {
-                const uint16_t* vr = Vt + (jg * 16 + qi) * LDV + 8 * hf;
+                for (int kb = 0; kb < BK / 16; ++kb) va[kb] = *(const uint4*) (vr + 16 * kb);
 #pragma unroll
-                for (int kb = 0; kb < BK / 16; ++kb) {
-                    uint4 va[4];
+                for (int j = 0; j < D / 16; ++j) {
+                    if (j + 1 < D / 16)
 #pragma unroll
-                    for (int j = 0; j < 4; ++j) va[j] = *(const uint4*) (vr + j * 16 * LDV + 16 * kb);
+                        for (int kb = 0; kb < BK / 16; ++kb)
+                            vn[kb] = *(const uint4*) (vr + (j + 1) * 16 * LDV + 16 * kb);
 #pragma unroll
-                    for (int j = 0; j < 4; ++j) o[jg + j] = pf_wmma(va[j], pb[kb], o[jg + j]);
+                    for (int kb = 0; kb < BK / 16; ++kb) o[j] = pf_wmma(va[kb], pb[kb], o[j]);
+#pragma unroll
+                    for (int kb = 0; kb < BK / 16; ++kb) va[kb] = vn[kb];
                 }
             }
-        } else if (more) {
-            asm volatile("" ::: "memory");
-            pf_fetch_v<F8>(R, vc, KD, kt + BK, k_hi, k_lo, ring0, kv_cap, tid);
+        } else {
+            carry_ok = false;
         }
+        pf_barrier();   // (every wave past its P V and bias: V's and proj's buffers free, K(t + 1) everyone's)
+        if (t + 1 < t1) pf_store_vp<F8>(R, Vt, Ps, tile_near(kt_of(t + 1)), tid);
+        if (t + 2 < t1) {
+            const int kt2 = kt_of(t + 2);
+            pf_fetch_vp<F8>(R, vc, KD, kt2, k_hi, k_lo, ring0, kv_cap, proj16, cq - kt2, tile_near(kt2), extent, tid);
+        }
+        // (V(t + 1) and proj(t + 1) are everyone's after the next iteration's first barrier, before they are read)
+        if (t + 1 < t1) load_q();
     }
     const float l_tot = l_run + pf_xhalf(l_run);
     if (!qok) return;
@@ -6326,7 +6357,7 @@ bool attn_prefill_ok() {
 #endif
 }
 int attn_prefill_splits(int Tq, int H, int nk, int n_sm) {
-    const int blocks = (Tq + 63) / 64 * H;
+    const int blocks = (Tq + 127) / 128 * H;
     const int want = (2 * n_sm + blocks - 1) / blocks;   // (about two waves of one workgroup a CU)
     const int most = std::max(1, nk / 512);              // (>= 512 keys a split)
     return std::max(1, std::min({want, most, 16}));
@@ -6339,14 +6370,15 @@ void attn_prefill_launch(const uint16_t* q16, int q_ld, const void* kc, const vo
                          const float* proj, int extent, int window, const float* sink, float* out, int o_ld,
                          float* scratch, size_t scratch_floats, int n_split, cudaStream_t s) {
     if (Tq <= 0) return;
-    if (D != pf::D || d_rel != 16 || H % KV || (q_ld & 7) || (r_ld & 3) || (o_ld & 3) || !attn_prefill_ok()) {
-        std::fprintf(stderr, "ik2::k::attn_prefill: D = %d, d_rel = %d, H = %d, KV = %d, q_ld = %d, r_ld = %d, o_ld = %d:"
-                     " not supported\n", D, d_rel, H, KV, q_ld, r_ld, o_ld);
+    if (D != pf::D || d_rel != 16 || H % KV || (q_ld & 7) || (r_ld & 3) || (o_ld & 3) || !attn_prefill_ok() ||
+        (kv_cap > 0 && kv_cap < std::min(Tq, pf::BQ) + window - 1)) {
+        std::fprintf(stderr, "ik2::k::attn_prefill: D = %d, d_rel = %d, H = %d, KV = %d, q_ld = %d, r_ld = %d, o_ld = %d,"
+                     " kv_cap = %d (window %d): not supported\n", D, d_rel, H, KV, q_ld, r_ld, o_ld, kv_cap, window);
         std::abort();
     }
     // proj as FP16 hi / lo at the scratch's start, the splits' partials after it
     extent = std::max(extent, 0);
-    const int p_rows = pf::kProjPad + extent + 1;
+    const int p_rows = extent + 2;
     const size_t p_floats = ((size_t) p_rows * 16 + 63) & ~(size_t) 63;
     uint16_t* proj16 = (uint16_t*) scratch;
     pf_proj16_kernel<<<(unsigned) ((p_rows * 16 + 255) / 256), 256, 0, s>>>(proj, extent, proj16);
@@ -6359,13 +6391,13 @@ void attn_prefill_launch(const uint16_t* q16, int q_ld, const void* kc, const vo
     const dim3 grid((unsigned) ((Tq + pf::BQ - 1) / pf::BQ), (unsigned) H, (unsigned) n_split);
     const float sc = qk_scale * kLog2e;
     if (n_split == 1) {
-        attn_prefill_kernel<F8, false><<<grid, pf::NW * 32, pf::kSmem, s>>>(
+        attn_prefill_kernel<F8, false><<<grid, pf::NT, pf::kSmem, s>>>(
             q16, q_ld, kc, vc, kv_cap, H, KV, Tq, qpos0, sc, out_scale, r, r_ld, proj16, extent, window, sink, out,
             o_ld, 1, nullptr, nullptr);
         check("attn_prefill");
         return;
     }
-    attn_prefill_kernel<F8, true><<<grid, pf::NW * 32, pf::kSmem, s>>>(q16, q_ld, kc, vc, kv_cap, H, KV, Tq, qpos0, sc,
+    attn_prefill_kernel<F8, true><<<grid, pf::NT, pf::kSmem, s>>>(q16, q_ld, kc, vc, kv_cap, H, KV, Tq, qpos0, sc,
                                                                        out_scale, r, r_ld, proj16, extent, window, sink,
                                                                        out, o_ld, n_split, o_part, ml_part);
     check("attn_prefill (splits)");

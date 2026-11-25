@@ -1579,6 +1579,9 @@ void test_attn_prefill() {
         {1100, 2500, 1024, 1024, 2124, 1, "1100 at 2500, ring 2124, window 1024"},
         {40, 5000, 1024, 1024, 1100, 4, "40 at 5000, ring 1100, 4 splits"},
         {300, 700, 512, 128, 900, 1, "300 at 700, ring 900, window 512, extent 128"},
+        {200, 3000, 256, 1024, 600, 1, "200 at 3000, ring 600, window 256 < extent 1024"},
+        {150, 100, 1 << 30, 16, 0, 2, "150 at 100, extent 16, 2 splits"},
+        {2100, 1000, 1 << 30, 1024, 0, 1, "2100 at 1000, full, extent 1024"},
     };
     for (int fp8 = 0; fp8 < 2; ++fp8)
         for (const Case& c : cases) {
@@ -1704,6 +1707,10 @@ void test_attn_prefill() {
 // model's shapes - 8192 queries of 24 heads (8 K / V heads), a sliding layer's ring and window and a full layer's
 // prefix - the milliseconds a call, FP8 and FP16 caches.
 void bench_attn_prefill() {
+    if (!k::attn_prefill_ok()) {
+        std::printf("skip bench (not a gfx12 HIP build)\n");
+        return;
+    }
     const int H = 24, KV = 8, D = 128, DR = 16, T = 8192;
     struct Case {
         int qpos0, window, kv_cap;
@@ -1772,14 +1779,17 @@ void bench_attn_prefill() {
                 auto run = [&] { which ? run_new() : run_old(); };
                 run();
                 CU(cudaDeviceSynchronize());
-                const int reps = 5;
-                CU(cudaEventRecord(e0, 0));
-                for (int i = 0; i < reps; ++i) run();
-                CU(cudaEventRecord(e1, 0));
-                CU(cudaEventSynchronize(e1));
-                float t = 0;
-                CU(cudaEventElapsedTime(&t, e0, e1));
-                ms[which] = t / reps;
+                // (the fastest of 8 calls: the display shares this GPU, and a call it slowed is not the kernel's time)
+                ms[which] = 1e30;
+                for (int i = 0; i < (which ? 8 : 3); ++i) {
+                    CU(cudaEventRecord(e0, 0));
+                    run();
+                    CU(cudaEventRecord(e1, 0));
+                    CU(cudaEventSynchronize(e1));
+                    float t = 0;
+                    CU(cudaEventElapsedTime(&t, e0, e1));
+                    ms[which] = std::min(ms[which], (double) t);
+                }
             }
             // (the FLOPs: QK^T and PV over each query's keys)
             double pairs = 0;
