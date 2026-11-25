@@ -368,7 +368,11 @@ inline bool dual() { return g_ep || g_tp; }
 // they are picked, so the two GPUs' shares come out as asked; without it by a hash of the expert.
 std::vector<uint8_t> g_ep_own;
 inline int ep_owner(int l, int e) { return g_ep_own[(size_t) l * g_pop_E_ep + e]; }
-bool g_flash = true;   // IK2_FLASH=0: the prefill's attention (FP16 KV) through the logits in memory and cuBLAS, not fused
+bool g_flash = true;   // IK2_FLASH=0: the prefill's attention through the logits in memory and cuBLAS, not fused
+// IK2_FA_PREFILL: the prompt's attention through k::attn_prefill (gfx12's matrix core, the relative bias computed in
+// the kernel, the whole chunk one launch; the default where the device has it), =0 the relative-bias GEMM + attn_flash
+// a 512-row block at a time as before, =2 both on the same inputs, compared (an instrument)
+int g_fa_prefill = 1;
 int g_n_sm = 0;
 bool g_group = true;   // IK2_GROUP=0: 2 .. 8 tokens' experts a slot at a time, their attention a head at a time
 bool g_group_exp = true, g_group_attn = true;   // (IK2_GROUP=1: the experts grouped only, 2: the attention only)
@@ -1707,8 +1711,25 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                                   c.d_rel, Ly.rel_proj, extent, window, sink_p + (size_t) ts * c.H, g_s);
             }
         };
-        if (g_flash && c.D == 128 && W.relb && extent <= W.relb_ext) {
+        // the prompt's fused attention: attn_prefill (IK2_FA_PREFILL; a ring must hold every key of a 128-query block's,
+        // as pos % kv_cap is one subtraction there), else the relative-bias GEMM + attn_flash a 512-row block at a time
+        const bool fa_new = g_fa_prefill && g_flash && c.D == 128 && c.d_rel == 16 && k::attn_prefill_ok() &&
+                            (attn_kv_cap == 0 || attn_kv_cap >= std::min(T, 128) + c.window - 1);
+        const bool fa_old = g_flash && c.D == 128 && W.relb && extent <= W.relb_ext;
+        if (fa_new || fa_old)
             if (!g_n_sm) CU(cudaDeviceGetAttribute(&g_n_sm, cudaDevAttrMultiProcessorCount, Ly.dev));
+        auto run_new = [&] {
+            const int k_lo = Ly.sliding ? std::max(0, pos0 + T - 128 - c.window + 1) : 0;   // (the last block's keys)
+            const int ns = k::attn_prefill_splits(T, c.H, pos0 + T - k_lo, g_n_sm);
+            if (g_kv_fp8)
+                k::attn_prefill_fp8(W.x16, HD, Ly.kc8, Ly.vc8, attn_kv_cap, c.H, c.KV, c.D, T, pos0, qk_scale * k_inv,
+                                    v_inv, r_p, HR, c.d_rel, Ly.rel_proj, extent, window, sink_p, W.o, HD, W.lg,
+                                    W.lg_cap, ns, g_s);
+            else
+                k::attn_prefill_f16(W.x16, HD, Ly.kc, Ly.vc, attn_kv_cap, c.H, c.KV, c.D, T, pos0, qk_scale, r_p, HR,
+                                    c.d_rel, Ly.rel_proj, extent, window, sink_p, W.o, HD, W.lg, W.lg_cap, ns, g_s);
+        };
+        auto run_old = [&] {
             for (int ts = 0; ts < T; ts += Work::kRelbRows) {
                 const int Tq = std::min(Work::kRelbRows, T - ts);
                 const float one_f = 1.0f, zero_f = 0.0f;
@@ -1726,6 +1747,30 @@ void run_layer_attn(const Model& M, Layer& Ly, int l, int T, int pos0, const flo
                                       pos0 + ts, qk_scale, W.relb, extent, window, sink_p + (size_t) ts * c.H,
                                       W.o + (size_t) ts * HD, HD, W.lg, W.lg_cap, ns, g_s);
             }
+        };
+        if (fa_new && fa_old && g_fa_prefill == 2) {
+            // IK2_FA_PREFILL=2: both on the same inputs, compared (stderr: the old output's largest |value|, the largest
+            // |new - old| over it, ||new - old|| / ||old||); the new one's output kept
+            const size_t n = (size_t) T * HD;
+            std::vector<float> a(n), b(n);
+            run_old();
+            CU(cudaMemcpyAsync(a.data(), W.o, n * 4, cudaMemcpyDeviceToHost, g_s));
+            run_new();
+            CU(cudaMemcpyAsync(b.data(), W.o, n * 4, cudaMemcpyDeviceToHost, g_s));
+            CU(cudaStreamSynchronize(g_s));
+            double mx = 0, md = 0, s2 = 0, d2 = 0;
+            for (size_t i = 0; i < n; ++i) {
+                const double d = (double) b[i] - a[i];
+                mx = std::max(mx, (double) std::fabs(a[i])), md = std::max(md, std::fabs(d));
+                s2 += (double) a[i] * a[i], d2 += d * d;
+            }
+            std::fprintf(stderr, "fa-check layer %d (%s) T %d pos0 %d: max|old| %.3g, max|new-old|/max|old| %.3e, rel L2 %.3e\n",
+                         l, Ly.sliding ? "sliding" : "full", T, pos0, mx, md / std::max(mx, 1e-30),
+                         std::sqrt(d2 / std::max(s2, 1e-300)));
+        } else if (fa_new) {
+            run_new();
+        } else if (fa_old) {
+            run_old();
         } else
         for (int ts = 0; ts < T;) {
             const int k0_s = Ly.sliding ? std::max(0, pos0 + ts - c.window + 1) : 0;
@@ -4222,6 +4267,7 @@ int main(int argc, char** argv) {
     }
     g_prof = getenv("IK2_PROF") && std::atoi(getenv("IK2_PROF"));
     g_flash = !(getenv("IK2_FLASH") && !std::atoi(getenv("IK2_FLASH")));
+    if (getenv("IK2_FA_PREFILL")) g_fa_prefill = std::atoi(getenv("IK2_FA_PREFILL"));
     g_mv = !getenv("IK2_MV") || std::atoi(getenv("IK2_MV"));
     g_group = !getenv("IK2_GROUP") || std::atoi(getenv("IK2_GROUP"));
     if (getenv("IK2_GROUP")) {

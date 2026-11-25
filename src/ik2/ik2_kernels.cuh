@@ -97,6 +97,26 @@ void attn_flash_fp8(const uint16_t* q16, int q_ld, const uint8_t* kc, const uint
 /// a split count for attn_flash_f16: Tq queries x H heads against up to nk keys on n_sm SMs
 int attn_flash_splits(int Tq, int H, int nk, int n_sm);
 
+/// The prompt's attention on gfx12's matrix core (IK2_FA_PREFILL), D = 128, d_rel = 16: attn_flash_f16 / _fp8's
+/// inputs and output, the relative bias computed in the kernel from r and proj (as attn_probs: r [Tq] rows of r_ld,
+/// head h's d_rel values at h * d_rel; proj [extent][d_rel]) instead of read from a table.  Any Tq (one launch);
+/// a ring (kv_cap > 0) must hold every key of a 128-query block's (kv_cap >= min(Tq, 128) + window - 1: the
+/// engine's window + chunk does).  scratch: (extent + 2) * 16 floats (proj as FP16) + n_split * Tq * H * (D + 2)
+/// floats for the splits (fewer splits if it holds fewer).
+/// attn_prefill_ok: the device can run it (a HIP build on gfx12).
+bool attn_prefill_ok();
+void attn_prefill_f16(const uint16_t* q16, int q_ld, const uint16_t* kc, const uint16_t* vc, int kv_cap, int H, int KV,
+                      int D, int Tq, int qpos0, float qk_scale, const float* r, int r_ld, int d_rel, const float* proj,
+                      int extent, int window, const float* sink, float* out, int o_ld, float* scratch,
+                      size_t scratch_floats, int n_split, cudaStream_t s);
+/// over an FP8 (E4M3) cache: qk_scale with K's scale folded in, the output times v_inv_scale
+void attn_prefill_fp8(const uint16_t* q16, int q_ld, const uint8_t* kc, const uint8_t* vc, int kv_cap, int H, int KV,
+                      int D, int Tq, int qpos0, float qk_scale, float v_inv_scale, const float* r, int r_ld, int d_rel,
+                      const float* proj, int extent, int window, const float* sink, float* out, int o_ld,
+                      float* scratch, size_t scratch_floats, int n_split, cudaStream_t s);
+/// a split count for attn_prefill: Tq queries x H heads against up to nk keys on n_sm CUs
+int attn_prefill_splits(int Tq, int H, int nk, int n_sm);
+
 /// o *= sigmoid(g), n values.
 void gate_mul(float* o, const float* g, size_t n, cudaStream_t s);
 /// o16[i] = f2h(o[i] * sigmoid(g[i])), and writes o[i] when write_f32 is true.

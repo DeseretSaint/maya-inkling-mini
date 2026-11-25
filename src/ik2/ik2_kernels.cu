@@ -5663,6 +5663,471 @@ experts_block_down_q8_kernel(const uint8_t* const* __restrict__ blob, const int*
     }
 }
 
+#if defined(__HIP_PLATFORM_AMD__)
+// ---- the prompt's attention on gfx12 (IK2_FA_PREFILL=1): FlashAttention-2 on the WMMA core, both products
+// transposed so that a lane owns one query.  A workgroup: 128 queries (8 waves x 16) of one head; the keys in tiles
+// of 32, each tile's K (FP16, [key][dim]) and V^T (FP16, [dim][key]) in shared memory once for the eight waves (an
+// FP8 cache's bytes made FP16 by the hardware's conversion - exact - as they are stored).  The tile is staged in two
+// halves around the compute so that one buffer of each is enough: K(t + 1) is stored once every wave is past its
+// Q K^T of tile t, V(t + 1) once every wave is past its P V; each half's bytes are loaded into registers a whole
+// iteration ahead.
+//   S^T = K Q^T      A = K rows (keys) from shared memory, B = Q^T (the wave's 16 queries): lane l gets query
+//                    l % 16's logits at keys 8 (l >> 4) + i of each 16-key block.
+//   O^T += V^T P^T   A = V^T rows (dims), B = P^T - exactly the lane's own probabilities of the block, so P never
+//                    leaves the registers;  O^T: lane l holds query l % 16's dims 8 (l >> 4) + i of each 16-dim block.
+// The online softmax is a lane's own 16 logits a tile and one cross-half exchange; the output's rescale a lane's own
+// scalar (skipped when no lane's maximum moved).  The relative bias r[q] . proj[dist] (d_rel = 16) is computed here,
+// not read from a table: a wave's 16 x 32 (query, key) pairs of a tile need 47 distances, i.e. three 16 x 16 x 16
+// products D[dist][query] = proj . r^T (one of them the tile before's), each as three FP16 products (hi . hi +
+// hi . lo + lo . hi of the F32 values split in two halves: ~F32 accuracy), the tile's 160 proj rows (hi, lo) staged
+// in shared memory with V.  The products go to a per-wave table skewed by the query (row q at column dist - q), so
+// each lane reads its 8 keys of a block back as two aligned 16-byte loads.  The causal / window mask, the sink, and
+// with splits attn_flash_combine, as attn_flash's.
+namespace pf {
+constexpr int BQ = 128, BK = 32, NW = 8, NT = NW * 32, D = 128;
+constexpr int LDK = D + 8;    // K tile [BK][LDK] halves (row pad: a 16-byte load a lane, conflict-free)
+constexpr int LDV = BK + 8;   // V^T tile [D][LDV] halves
+constexpr int NP = BQ + BK;   // proj rows a tile: distances c - 31 .. c + 128, c = the block's first query - kt
+constexpr int LDP = 40;       // a proj row [hi 16][lo 16] + pad, halves
+constexpr int LDB = BK + 4;   // a wave's bias table [16][LDB] floats
+constexpr int kPChunks = NP * 4;   // 16-byte chunks of a tile's proj rows
+constexpr int kSmem = BK * LDK * 2 + D * LDV * 2 + NP * LDP * 2 + NW * 16 * LDB * 4;   // 50,176 bytes
+}   // namespace pf
+#if defined(__gfx1200__) || defined(__gfx1201__)
+typedef _Float16 pf_h8 __attribute__((ext_vector_type(8)));
+typedef float pf_f8 __attribute__((ext_vector_type(8)));
+__device__ __forceinline__ pf_f8 pf_wmma(const uint4& a, const uint4& b, const pf_f8& c) {
+    return __builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12(__builtin_bit_cast(pf_h8, a), __builtin_bit_cast(pf_h8, b),
+                                                            c);
+}
+// two FP16 of values FP16 holds exactly (an E4M3 byte's): round-toward-zero is exact
+__device__ __forceinline__ uint32_t pf_pk_exact(float a, float b) {
+    return __builtin_bit_cast(uint32_t, __builtin_amdgcn_cvt_pkrtz(a, b));
+}
+// 4 E4M3 bytes -> 4 F32 (the hardware's OCP E4M3 conversion: exact)
+__device__ __forceinline__ void pf_e4m3x4(uint32_t w, float* f) {
+    typedef float f2 __attribute__((ext_vector_type(2)));
+    const f2 a = __builtin_amdgcn_cvt_pk_f32_fp8((int) w, false), b = __builtin_amdgcn_cvt_pk_f32_fp8((int) w, true);
+    f[0] = a.x, f[1] = a.y, f[2] = b.x, f[3] = b.y;
+}
+__device__ __forceinline__ float pf_xhalf(float v) {   // lane l's value at lane l ^ 16
+    return __builtin_bit_cast(float, __builtin_amdgcn_permlanex16(__builtin_bit_cast(int, v), __builtin_bit_cast(int, v),
+                                                                  0x76543210, (int) 0xfedcba98u, false, false));
+}
+// the workgroup's barrier for the shared-memory tiles alone (__syncthreads also invalidates the vector cache, which
+// would drop the next tile's Q and K / V lines)
+__device__ __forceinline__ void pf_barrier() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "workgroup", "local");
+    __builtin_amdgcn_s_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "workgroup", "local");
+}
+__device__ __forceinline__ void pf_wave_sync() {
+    __builtin_amdgcn_fence(__ATOMIC_RELEASE, "wavefront");
+    __builtin_amdgcn_wave_barrier();
+    __builtin_amdgcn_fence(__ATOMIC_ACQUIRE, "wavefront");
+}
+#endif
+// a tile's bytes as loaded: K (FP8: 2 x 8 B a thread; FP16: 2 x 16 B), V (FP8: 4 keys x 4 B; FP16: 4 x 8 B), the tile's
+// proj rows (up to 3 x 16 B)
+template <bool F8>
+struct PfRegs;
+template <>
+struct PfRegs<true> {
+    uint2 k[2];
+    uint32_t v[4];
+    uint4 p[3];
+};
+typedef unsigned pf_u4 __attribute__((ext_vector_type(4)));   // (HIP's uint4 members kept FP16's K in scratch)
+template <>
+struct PfRegs<false> {
+    pf_u4 k[2];
+    uint2 v[4];
+    uint4 p[3];
+};
+// a key's row of the cache (an offset in elements): kp in [k_lo, k_hi), clamped to k_hi - 1 (the tile's rows past
+// the block's last key: real keys, masked).  A ring holds every key of [k_lo, k_hi) (kv_cap >= the window + the
+// chunk), so pos % kv_cap is one conditional subtraction from k_lo's slot.
+__device__ __forceinline__ uint32_t pf_row(int kp, int k_hi, int k_lo, int ring0, int kv_cap, int KD) {
+    kp = min(kp, k_hi - 1);
+    int pr = kp;
+    if (kv_cap > 0) {
+        pr = kp - k_lo + ring0;
+        pr = pr >= kv_cap ? pr - kv_cap : pr;
+    }
+    return __umul24((uint32_t) pr, (uint32_t) KD);
+}
+// K: FP8 thread t the bytes 8 (t & 7) .. + 7 and 64 + 8 (t & 7) .. + 7 of key t >> 3; FP16 the 16 bytes (c & 15) of
+// key c >> 4, c = t, t + 256
+template <bool F8>
+__device__ __forceinline__ void pf_fetch_k(PfRegs<F8>& R, const void* kc, int KD, int kt, int k_hi, int k_lo,
+                                           int ring0, int kv_cap, int tid) {
+    if constexpr (F8) {
+        const uint8_t* kr = (const uint8_t*) kc + pf_row(kt + (tid >> 3), k_hi, k_lo, ring0, kv_cap, KD) + (tid & 7) * 8;
+        R.k[0] = *(const uint2*) kr, R.k[1] = *(const uint2*) (kr + 64);
+    } else {
+        const uint16_t* kb = (const uint16_t*) kc + (tid & 15) * 8;
+        R.k[0] = *(const pf_u4*) (kb + pf_row(kt + (tid >> 4), k_hi, k_lo, ring0, kv_cap, KD));
+        R.k[1] = *(const pf_u4*) (kb + pf_row(kt + 16 + (tid >> 4), k_hi, k_lo, ring0, kv_cap, KD));
+    }
+}
+// V: thread t the 4 keys 4 (t & 7) .. + 3 at the 4 dims 4 (t >> 3) .. + 3 (the transpose's block: a store's lanes write
+// two rows' 64 bytes, conflict-free; the loads 8 keys' 16 bytes an instruction); proj: the 16-byte
+// chunks t, t + 256, t + 512 (< 640) of the tile's rows, row i the distance c - 31 + i (clamped: the zero rows of
+// proj16 before distance 0 and at extent), when the tile needs any
+template <bool F8>
+__device__ __forceinline__ void pf_fetch_vp(PfRegs<F8>& R, const void* vc, int KD, int kt, int k_hi, int k_lo,
+                                            int ring0, int kv_cap, const uint16_t* proj16, int c, bool near,
+                                            int extent, int tid) {
+    const int col = (tid >> 3) * 4;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const uint32_t off = pf_row(kt + (tid & 7) * 4 + j, k_hi, k_lo, ring0, kv_cap, KD) + col;
+        if constexpr (F8) R.v[j] = *(const uint32_t*) ((const uint8_t*) vc + off);
+        else R.v[j] = *(const uint2*) ((const uint16_t*) vc + off);
+    }
+    if (near) {
+#pragma unroll
+        for (int j = 0; j < 3; ++j) {
+            const int idx = j * pf::NT + tid;
+            if (j < 2 || idx < pf::kPChunks) {
+                const int dist = c - (pf::BK - 1) + (idx >> 2);
+                const int row = max(-1, min(dist, extent)) + 1;
+                R.p[j] = *(const uint4*) (proj16 + (size_t) row * 32 + (idx & 3) * 8);
+            }
+        }
+    }
+}
+#if defined(__gfx1200__) || defined(__gfx1201__)
+template <bool F8>
+__device__ __forceinline__ void pf_store_k(const PfRegs<F8>& R, uint16_t* Ks, int tid) {
+    using namespace pf;
+    if constexpr (F8) {   // (a row's eight lanes store 128 contiguous bytes an instruction: no bank conflicts)
+        uint16_t* dst = Ks + (tid >> 3) * LDK + (tid & 7) * 8;
+#pragma unroll
+        for (int i = 0; i < 2; ++i) {
+            float f[8];
+            pf_e4m3x4(R.k[i].x, f), pf_e4m3x4(R.k[i].y, f + 4);
+            *(uint4*) (dst + 64 * i) = make_uint4(pf_pk_exact(f[0], f[1]), pf_pk_exact(f[2], f[3]),
+                                                  pf_pk_exact(f[4], f[5]), pf_pk_exact(f[6], f[7]));
+        }
+    } else {
+        uint16_t* dst = Ks + (tid >> 4) * LDK + (tid & 15) * 8;
+        *(pf_u4*) dst = R.k[0];
+        *(pf_u4*) (dst + 16 * LDK) = R.k[1];
+    }
+}
+template <bool F8>
+__device__ __forceinline__ void pf_store_vp(const PfRegs<F8>& R, uint16_t* Vt, uint16_t* Ps, bool near, int tid) {
+    using namespace pf;
+    const int kg = tid & 7, dg = tid >> 3;
+    uint16_t* vd = Vt + dg * 4 * LDV + kg * 4;   // dim 4 dg + e, keys 4 kg .. + 3 at vd + e * LDV
+    if constexpr (F8) {
+        float f[4][4];   // [key][dim]
+#pragma unroll
+        for (int j = 0; j < 4; ++j) pf_e4m3x4(R.v[j], f[j]);
+#pragma unroll
+        for (int e = 0; e < 4; ++e)
+            *(uint2*) (vd + e * LDV) = make_uint2(pf_pk_exact(f[0][e], f[1][e]), pf_pk_exact(f[2][e], f[3][e]));
+    } else {
+        // dim 2p of key j: the low half of R.v[j]'s word p; dim 2p + 1 the high half
+#pragma unroll
+        for (int p = 0; p < 2; ++p) {
+            const uint32_t w0 = p ? R.v[0].y : R.v[0].x, w1 = p ? R.v[1].y : R.v[1].x;
+            const uint32_t w2 = p ? R.v[2].y : R.v[2].x, w3 = p ? R.v[3].y : R.v[3].x;
+            *(uint2*) (vd + 2 * p * LDV) =
+                make_uint2(__builtin_amdgcn_perm(w1, w0, 0x05040100u), __builtin_amdgcn_perm(w3, w2, 0x05040100u));
+            *(uint2*) (vd + (2 * p + 1) * LDV) =
+                make_uint2(__builtin_amdgcn_perm(w1, w0, 0x07060302u), __builtin_amdgcn_perm(w3, w2, 0x07060302u));
+        }
+    }
+    if (near) {
+#pragma unroll
+        for (int j = 0; j < 3; ++j) {
+            const int idx = j * NT + tid;
+            if (j < 2 || idx < kPChunks) *(uint4*) (Ps + (idx >> 2) * LDP + (idx & 3) * 8) = R.p[j];
+        }
+    }
+}
+#endif
+
+// proj [extent][16] F32 -> rows [extent + 2][32] FP16: a zero row (distances < 0), each distance's 16 high halves and
+// 16 low (v - hi), a zero row (distances >= extent)
+__global__ void pf_proj16_kernel(const float* __restrict__ proj, int extent, uint16_t* __restrict__ out) {
+    const int i = blockIdx.x * blockDim.x + threadIdx.x, row = i >> 4, k = i & 15;
+    if (row >= extent + 2) return;
+    const int dist = row - 1;
+    const float v = dist >= 0 && dist < extent ? proj[(size_t) dist * 16 + k] : 0.0f;
+    const uint16_t hi = f2h(v);
+    out[(size_t) row * 32 + k] = hi;
+    out[(size_t) row * 32 + 16 + k] = f2h(v - h2f(hi));
+}
+
+// q16 [Tq] rows of q_ld (head h at h * 128) at positions qpos0 ..; the cache's rows [pos or pos % kv_cap][KV * 128];
+// sc = qk_scale * log2(e) (FP8: K's scale in it); r [Tq] rows of r_ld (head h's 16 at h * 16); proj16 as above;
+// sink [Tq][H]; SPLIT: the split's partials (o_part / ml_part as attn_flash_f16_kernel's), else out [Tq] rows of
+// o_ld = O / den * out_scale.
+template <bool F8, bool SPLIT>
+__global__ void __launch_bounds__(pf::NT)
+attn_prefill_kernel(const uint16_t* __restrict__ q16, int q_ld, const void* __restrict__ kc,
+                    const void* __restrict__ vc, int kv_cap, int H, int KV, int Tq, int qpos0, float sc,
+                    float out_scale, const float* __restrict__ r, int r_ld, const uint16_t* __restrict__ proj16,
+                    int extent, int window, const float* __restrict__ sink, float* __restrict__ out, int o_ld,
+                    int n_split, float* __restrict__ o_part, float2* __restrict__ ml_part) {
+#if defined(__gfx1200__) || defined(__gfx1201__)
+    using namespace pf;
+    extern __shared__ __align__(16) uint16_t pf_sm[];
+    uint16_t* Ks = pf_sm;
+    uint16_t* Vt = Ks + BK * LDK;
+    uint16_t* Ps = Vt + D * LDV;
+    const int tid = threadIdx.x, wave = tid >> 5, lane = tid & 31, qi = lane & 15, hf = lane >> 4;
+    float* bt = (float*) (Ps + NP * LDP) + (wave * 16 + qi) * LDB;   // this lane's row of its wave's bias table
+    const int nqb = (Tq + BQ - 1) / BQ;
+    const int qb = nqb - 1 - (int) blockIdx.x;   // (the longest key ranges first)
+    const int h = blockIdx.y, split = blockIdx.z, g = h / (H / KV), KD = KV * D;
+    const int i0 = qb * BQ, i_last = min(Tq, i0 + BQ) - 1;
+    const int k_hi = qpos0 + i_last + 1, k_lo = max(0, qpos0 + i0 - window + 1);
+    const int n_tiles = (k_hi - k_lo + BK - 1) / BK;
+    const int per = (n_tiles + n_split - 1) / n_split;
+    const int t0 = min(n_tiles, split * per), t1 = min(n_tiles, t0 + per);
+    const int ring0 = kv_cap > 0 ? k_lo % kv_cap : 0;
+    if constexpr (F8) kc = (const uint8_t*) kc + (size_t) g * D, vc = (const uint8_t*) vc + (size_t) g * D;
+    else kc = (const uint16_t*) kc + (size_t) g * D, vc = (const uint16_t*) vc + (size_t) g * D;
+
+    const int wi = i0 + wave * 16, iq = wi + qi;
+    const bool qok = iq < Tq, w_on = wi < Tq, w_rows = wi + 15 < Tq;
+    const int qw = qpos0 + wi;                                      // the wave's first query's position
+    const int kw_hi = qpos0 + min(wi + 15, Tq - 1) + 1, kw_lo = qw - window + 1;   // its keys [kw_lo, kw_hi)
+    const int cq = qpos0 + i0;   // - kt: the block's first query's distance to a tile's first key
+
+    // Q^T as the B operand: query qi's dims 16 ds + 8 hf .. + 7 (re-read each tile, from the cache: its 32 registers
+    // are then free outside Q K^T; a row past Tq reads row 0, masked)
+    const uint4* qrow = (const uint4*) (q16 + (size_t) (qok ? iq : 0) * q_ld + (size_t) h * D + 8 * hf);
+    uint4 rh, rl;   // r^T (log2 units) as the B operand, split hi + lo
+    {
+        const float* rr = r + (size_t) (qok ? iq : 0) * r_ld + (size_t) h * 16 + 8 * hf;
+        const float4 a = *(const float4*) rr, b = *(const float4*) (rr + 4);
+        const float rv[8] = {a.x, a.y, a.z, a.w, b.x, b.y, b.z, b.w};
+        uint32_t hw[4], lw[4];
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const float x0 = qok ? rv[2 * e] * kLog2e : 0.0f, x1 = qok ? rv[2 * e + 1] * kLog2e : 0.0f;
+            const uint16_t h0 = f2h(x0), h1 = f2h(x1);
+            hw[e] = (uint32_t) h0 | ((uint32_t) h1 << 16);
+            lw[e] = (uint32_t) f2h(x0 - h2f(h0)) | ((uint32_t) f2h(x1 - h2f(h1)) << 16);
+        }
+        rh = make_uint4(hw[0], hw[1], hw[2], hw[3]), rl = make_uint4(lw[0], lw[1], lw[2], lw[3]);
+    }
+    float m_run = -1e30f, l_run = 0.0f;   // (log2 units; the halves' l summed at the end)
+    if constexpr (!SPLIT) {
+        const float sk = sink[(size_t) (qok ? iq : 0) * H + h] * kLog2e;
+        if (qok) m_run = sk, l_run = hf == 0 ? 1.0f : 0.0f;
+    }
+    pf_f8 o[D / 16];
+#pragma unroll
+    for (int j = 0; j < D / 16; ++j)
+#pragma unroll
+        for (int e = 0; e < 8; ++e) o[j][e] = 0.0f;
+    pf_f8 carry;   // the bias block 0 of the wave's tile before: this tile's block 2 (the same distances)
+#pragma unroll
+    for (int e = 0; e < 8; ++e) carry[e] = 0.0f;
+    bool carry_ok = false;
+
+    PfRegs<F8> R;
+    // a tile needs the bias if its nearest pair (the block's first query, the tile's last key) is within the extent
+    auto tile_near = [&](int kt) { return cq - (kt + BK - 1) < extent; };
+    auto kt_of = [&](int t) { return k_lo + t * BK; };
+    if (t0 < t1) {   // tile t0 staged, t0 + 1's bytes in the registers
+        pf_fetch_k<F8>(R, kc, KD, kt_of(t0), k_hi, k_lo, ring0, kv_cap, tid);
+        pf_fetch_vp<F8>(R, vc, KD, kt_of(t0), k_hi, k_lo, ring0, kv_cap, proj16, cq - kt_of(t0), tile_near(kt_of(t0)),
+                        extent, tid);
+        pf_store_k<F8>(R, Ks, tid);
+        pf_store_vp<F8>(R, Vt, Ps, tile_near(kt_of(t0)), tid);
+        if (t0 + 1 < t1) {
+            const int kt = kt_of(t0 + 1);
+            pf_fetch_k<F8>(R, kc, KD, kt, k_hi, k_lo, ring0, kv_cap, tid);
+            pf_fetch_vp<F8>(R, vc, KD, kt, k_hi, k_lo, ring0, kv_cap, proj16, cq - kt, tile_near(kt), extent, tid);
+        }
+    }
+    uint4 qf[D / 16];   // (the tile's Q, loaded at the end of the iteration before: in flight across its barrier)
+    auto load_q = [&] {
+        int z = 0;
+        asm volatile("" : "+s"(z));   // (an opaque zero: keeps the loads in the loop)
+#pragma unroll
+        for (int ds = 0; ds < D / 16; ++ds) qf[ds] = qrow[2 * ds + z];
+    };
+    load_q();
+    pf_barrier();
+    for (int t = t0; t < t1; ++t) {
+        const int kt = kt_of(t);
+        const bool on = w_on && kt < kw_hi && kt + BK - 1 >= kw_lo;   // (wave-uniform: a key of the tile for its rows)
+        const int c0 = qw - kt;                                      // dist(query qi, key kj) = c0 + qi - kj
+        // S^T = K Q^T: dims outer (two independent accumulators)
+        pf_f8 s[BK / 16];
+#pragma unroll
+        for (int kb = 0; kb < BK / 16; ++kb)
+#pragma unroll
+            for (int e = 0; e < 8; ++e) s[kb][e] = 0.0f;
+        if (on) {
+            // (K's fragments a step ahead: the step's two loads in flight while the step before's products run)
+            const uint16_t* kr = Ks + qi * LDK + 8 * hf;
+            uint4 ka[BK / 16], kn[BK / 16];
+#pragma unroll
+            for (int kb = 0; kb < BK / 16; ++kb) ka[kb] = *(const uint4*) (kr + kb * 16 * LDK);
+#pragma unroll
+            for (int ds = 0; ds < D / 16; ++ds) {
+                if (ds + 1 < D / 16)
+#pragma unroll
+                    for (int kb = 0; kb < BK / 16; ++kb) kn[kb] = *(const uint4*) (kr + kb * 16 * LDK + 16 * (ds + 1));
+#pragma unroll
+                for (int kb = 0; kb < BK / 16; ++kb) s[kb] = pf_wmma(ka[kb], qf[ds], s[kb]);
+#pragma unroll
+                for (int kb = 0; kb < BK / 16; ++kb) ka[kb] = kn[kb];
+            }
+        }
+        pf_barrier();   // (every wave past its Q K^T: K's buffer free)
+        if (t + 1 < t1) pf_store_k<F8>(R, Ks, tid);
+        if (t + 2 < t1) pf_fetch_k<F8>(R, kc, KD, kt_of(t + 2), k_hi, k_lo, ring0, kv_cap, tid);
+        if (on) {
+            const bool near = c0 - (BK - 1) < extent;   // some pair within the bias's extent
+            // the logits in log2 units: scale, + bias, mask
+            if (near) {
+                // block b's product: D[dist index 16 b + m][query], the distances c0 - 31 + 16 b + m
+                const uint16_t* prow = Ps + (16 * wave + qi) * LDP + 8 * hf;
+                auto blk = [&](int b) {
+                    pf_f8 a;
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) a[e] = 0.0f;
+                    const int d0 = c0 - (BK - 1) + 16 * b;
+                    if (d0 + 15 >= 0 && d0 < extent) {   // (uniform)
+                        const uint16_t* pr = prow + 16 * b * LDP;
+                        const uint4 ph = *(const uint4*) pr, pl = *(const uint4*) (pr + 16);
+                        a = pf_wmma(ph, rh, a);
+                        a = pf_wmma(ph, rl, a);
+                        a = pf_wmma(pl, rh, a);
+                    }
+                    return a;
+                };
+                // a[e] of block b: distance index dd = 16 b + 8 hf + e of query qi -> the table's column dd - qi,
+                // kept if in [0, 32): block 1 entirely; of blocks 0 and 2 exactly one for each e (the column
+                // (8 hf + e - qi) mod 32)
+                const pf_f8 a0 = blk(0), a2 = carry_ok ? carry : blk(2);
+#pragma unroll
+                for (int e = 0; e < 8; ++e) bt[(8 * hf + e - qi) & (BK - 1)] = 8 * hf + e >= qi ? a0[e] : a2[e];
+                carry = a0, carry_ok = true;
+                {
+                    const pf_f8 a1 = blk(1);
+                    float* bw = bt + 16 + 8 * hf - qi;
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) bw[e] = a1[e];
+                }
+                pf_wave_sync();
+#pragma unroll
+                for (int kb = 0; kb < BK / 16; ++kb) {   // key kj = 16 kb + 8 hf + e at column 31 - kj
+                    const int x0 = BK - 8 - 16 * kb - 8 * hf;
+                    const float4 u = *(const float4*) (bt + x0), v = *(const float4*) (bt + x0 + 4);
+                    const float bv[8] = {v.w, v.z, v.y, v.x, u.w, u.z, u.y, u.x};
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) s[kb][e] = fmaf(s[kb][e], sc, bv[e]);
+                }
+            } else {
+                carry_ok = false;
+#pragma unroll
+                for (int kb = 0; kb < BK / 16; ++kb)
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) s[kb][e] *= sc;
+            }
+            const bool full = w_rows && kt + BK - 1 <= qw && kt >= qw + 15 - window + 1;
+            if (!full) {
+#pragma unroll
+                for (int kb = 0; kb < BK / 16; ++kb)
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) {
+                        const int dist = c0 + qi - (16 * kb + 8 * hf + e);
+                        s[kb][e] = (!qok || dist < 0 || dist >= window) ? -INFINITY : s[kb][e];
+                    }
+            }
+            float mx = -INFINITY;
+#pragma unroll
+            for (int kb = 0; kb < BK / 16; ++kb)
+#pragma unroll
+                for (int e = 0; e < 8; ++e) mx = fmaxf(mx, s[kb][e]);
+            mx = fmaxf(mx, pf_xhalf(mx));
+            const float m_new = fmaxf(m_run, mx);
+            const bool moved = m_new > m_run;
+            const float alpha = __builtin_amdgcn_exp2f(m_run - m_new);
+            m_run = m_new;
+            float ls = 0.0f;
+            uint4 pb[BK / 16];   // P^T as the B operand, FP16
+#pragma unroll
+            for (int kb = 0; kb < BK / 16; ++kb) {
+                float p[8];
+#pragma unroll
+                for (int e = 0; e < 8; ++e) p[e] = __builtin_amdgcn_exp2f(s[kb][e] - m_new), ls += p[e];
+                pb[kb] = make_uint4(f2_to_u32(p[0], p[1]), f2_to_u32(p[2], p[3]), f2_to_u32(p[4], p[5]),
+                                    f2_to_u32(p[6], p[7]));
+            }
+            l_run = l_run * alpha + ls;
+            if (__builtin_amdgcn_ballot_w32(moved)) {   // (some lane's maximum moved: the rescale; alpha = 1 elsewhere)
+#pragma unroll
+                for (int j = 0; j < D / 16; ++j)
+#pragma unroll
+                    for (int e = 0; e < 8; ++e) o[j][e] *= alpha;
+            }
+            // O^T += V^T P^T: dims outer, the two key blocks inner
+            {
+                const uint16_t* vr = Vt + qi * LDV + 8 * hf;
+                uint4 va[BK / 16], vn[BK / 16];
+#pragma unroll
+                for (int kb = 0; kb < BK / 16; ++kb) va[kb] = *(const uint4*) (vr + 16 * kb);
+#pragma unroll
+                for (int j = 0; j < D / 16; ++j) {
+                    if (j + 1 < D / 16)
+#pragma unroll
+                        for (int kb = 0; kb < BK / 16; ++kb)
+                            vn[kb] = *(const uint4*) (vr + (j + 1) * 16 * LDV + 16 * kb);
+#pragma unroll
+                    for (int kb = 0; kb < BK / 16; ++kb) o[j] = pf_wmma(va[kb], pb[kb], o[j]);
+#pragma unroll
+                    for (int kb = 0; kb < BK / 16; ++kb) va[kb] = vn[kb];
+                }
+            }
+        } else {
+            carry_ok = false;
+        }
+        pf_barrier();   // (every wave past its P V and bias: V's and proj's buffers free, K(t + 1) everyone's)
+        if (t + 1 < t1) pf_store_vp<F8>(R, Vt, Ps, tile_near(kt_of(t + 1)), tid);
+        if (t + 2 < t1) {
+            const int kt2 = kt_of(t + 2);
+            pf_fetch_vp<F8>(R, vc, KD, kt2, k_hi, k_lo, ring0, kv_cap, proj16, cq - kt2, tile_near(kt2), extent, tid);
+        }
+        // (V(t + 1) and proj(t + 1) are everyone's after the next iteration's first barrier, before they are read)
+        if (t + 1 < t1) load_q();
+    }
+    const float l_tot = l_run + pf_xhalf(l_run);
+    if (!qok) return;
+    if constexpr (!SPLIT) {
+        const float f = out_scale / l_tot;
+        float* op = out + (size_t) iq * o_ld + (size_t) h * D + 8 * hf;
+#pragma unroll
+        for (int j = 0; j < D / 16; ++j) {
+            *(float4*) (op + 16 * j) = make_float4(o[j][0] * f, o[j][1] * f, o[j][2] * f, o[j][3] * f);
+            *(float4*) (op + 16 * j + 4) = make_float4(o[j][4] * f, o[j][5] * f, o[j][6] * f, o[j][7] * f);
+        }
+    } else {
+        float* op = o_part + (((size_t) split * Tq + iq) * H + h) * D + 8 * hf;
+#pragma unroll
+        for (int j = 0; j < D / 16; ++j) {
+            *(float4*) (op + 16 * j) = make_float4(o[j][0], o[j][1], o[j][2], o[j][3]);
+            *(float4*) (op + 16 * j + 4) = make_float4(o[j][4], o[j][5], o[j][6], o[j][7]);
+        }
+        if (hf == 0) ml_part[((size_t) split * Tq + iq) * H + h] = make_float2(l_tot > 0.0f ? m_run : -INFINITY, l_tot);
+    }
+#else
+    __builtin_trap();   // (gfx12 only: attn_prefill_ok() keeps the host from launching it elsewhere)
+#endif
+}
+#endif   // __HIP_PLATFORM_AMD__
+
 }  // namespace
 
 void rms(const float* x, const float* w, int rows, int D, float eps, float* y, cudaStream_t s) {
@@ -5874,6 +6339,104 @@ int attn_flash_splits(int Tq, int H, int nk, int n_sm) {
     const int want = (6 * n_sm + blocks - 1) / blocks;   // (about three waves of two blocks an SM)
     const int most = std::max(1, (nk + 16 * kFaBN - 1) / (16 * kFaBN));   // (>= 1024 keys a split)
     return std::max(1, std::min({want, most, 16}));
+}
+
+// ---- the prompt's attention on gfx12 (attn_prefill_kernel)
+bool attn_prefill_ok() {
+#if defined(__HIP_PLATFORM_AMD__)
+    static const bool ok = [] {
+        int dev = 0;
+        cudaGetDevice(&dev);
+        hipDeviceProp_t p{};
+        if (hipGetDeviceProperties(&p, dev) != hipSuccess) return false;
+        return std::strncmp(p.gcnArchName, "gfx120", 6) == 0;
+    }();
+    return ok;
+#else
+    return false;
+#endif
+}
+int attn_prefill_splits(int Tq, int H, int nk, int n_sm) {
+    const int blocks = (Tq + 127) / 128 * H;
+    const int want = (2 * n_sm + blocks - 1) / blocks;   // (about two waves of one workgroup a CU)
+    const int most = std::max(1, nk / 512);              // (>= 512 keys a split)
+    return std::max(1, std::min({want, most, 16}));
+}
+#if defined(__HIP_PLATFORM_AMD__)
+namespace {
+template <bool F8>
+void attn_prefill_launch(const uint16_t* q16, int q_ld, const void* kc, const void* vc, int kv_cap, int H, int KV,
+                         int D, int d_rel, int Tq, int qpos0, float qk_scale, float out_scale, const float* r, int r_ld,
+                         const float* proj, int extent, int window, const float* sink, float* out, int o_ld,
+                         float* scratch, size_t scratch_floats, int n_split, cudaStream_t s) {
+    if (Tq <= 0) return;
+    if (D != pf::D || d_rel != 16 || H % KV || (q_ld & 7) || (r_ld & 3) || (o_ld & 3) || !attn_prefill_ok() ||
+        (kv_cap > 0 && kv_cap < std::min(Tq, pf::BQ) + window - 1)) {
+        std::fprintf(stderr, "ik2::k::attn_prefill: D = %d, d_rel = %d, H = %d, KV = %d, q_ld = %d, r_ld = %d, o_ld = %d,"
+                     " kv_cap = %d (window %d): not supported\n", D, d_rel, H, KV, q_ld, r_ld, o_ld, kv_cap, window);
+        std::abort();
+    }
+    // proj as FP16 hi / lo at the scratch's start, the splits' partials after it
+    extent = std::max(extent, 0);
+    const int p_rows = extent + 2;
+    const size_t p_floats = ((size_t) p_rows * 16 + 63) & ~(size_t) 63;
+    uint16_t* proj16 = (uint16_t*) scratch;
+    pf_proj16_kernel<<<(unsigned) ((p_rows * 16 + 255) / 256), 256, 0, s>>>(proj, extent, proj16);
+    check("attn_prefill (proj)");
+    const size_t per_split = (size_t) Tq * H * (pf::D + 2);
+    const size_t room = scratch_floats > p_floats ? scratch_floats - p_floats : 0;
+    n_split = std::max(1, std::min<int>(n_split, (int) std::min<size_t>(room / per_split, 64)));
+    float* o_part = scratch + p_floats;
+    float2* ml_part = (float2*) (o_part + (size_t) n_split * Tq * H * pf::D);
+    const dim3 grid((unsigned) ((Tq + pf::BQ - 1) / pf::BQ), (unsigned) H, (unsigned) n_split);
+    const float sc = qk_scale * kLog2e;
+    if (n_split == 1) {
+        attn_prefill_kernel<F8, false><<<grid, pf::NT, pf::kSmem, s>>>(
+            q16, q_ld, kc, vc, kv_cap, H, KV, Tq, qpos0, sc, out_scale, r, r_ld, proj16, extent, window, sink, out,
+            o_ld, 1, nullptr, nullptr);
+        check("attn_prefill");
+        return;
+    }
+    attn_prefill_kernel<F8, true><<<grid, pf::NT, pf::kSmem, s>>>(q16, q_ld, kc, vc, kv_cap, H, KV, Tq, qpos0, sc,
+                                                                       out_scale, r, r_ld, proj16, extent, window, sink,
+                                                                       out, o_ld, n_split, o_part, ml_part);
+    check("attn_prefill (splits)");
+    attn_flash_combine_kernel<<<dim3((unsigned) Tq, (unsigned) H), kFaD, 0, s>>>(o_part, ml_part, n_split, Tq, H, sink,
+                                                                                 out, o_ld, out_scale);
+    check("attn_prefill (combine)");
+}
+}   // namespace
+#endif
+void attn_prefill_f16(const uint16_t* q16, int q_ld, const uint16_t* kc, const uint16_t* vc, int kv_cap, int H, int KV,
+                      int D, int Tq, int qpos0, float qk_scale, const float* r, int r_ld, int d_rel, const float* proj,
+                      int extent, int window, const float* sink, float* out, int o_ld, float* scratch,
+                      size_t scratch_floats, int n_split, cudaStream_t s) {
+#if defined(__HIP_PLATFORM_AMD__)
+    attn_prefill_launch<false>(q16, q_ld, kc, vc, kv_cap, H, KV, D, d_rel, Tq, qpos0, qk_scale, 1.0f, r, r_ld, proj,
+                               extent, window, sink, out, o_ld, scratch, scratch_floats, n_split, s);
+#else
+    (void) q16, (void) q_ld, (void) kc, (void) vc, (void) kv_cap, (void) H, (void) KV, (void) D, (void) Tq;
+    (void) qpos0, (void) qk_scale, (void) r, (void) r_ld, (void) d_rel, (void) proj, (void) extent, (void) window;
+    (void) sink, (void) out, (void) o_ld, (void) scratch, (void) scratch_floats, (void) n_split, (void) s;
+    std::fprintf(stderr, "ik2::k::attn_prefill_f16: gfx12 only\n");
+    std::abort();
+#endif
+}
+void attn_prefill_fp8(const uint16_t* q16, int q_ld, const uint8_t* kc, const uint8_t* vc, int kv_cap, int H, int KV,
+                      int D, int Tq, int qpos0, float qk_scale, float v_inv_scale, const float* r, int r_ld, int d_rel,
+                      const float* proj, int extent, int window, const float* sink, float* out, int o_ld,
+                      float* scratch, size_t scratch_floats, int n_split, cudaStream_t s) {
+#if defined(__HIP_PLATFORM_AMD__)
+    attn_prefill_launch<true>(q16, q_ld, kc, vc, kv_cap, H, KV, D, d_rel, Tq, qpos0, qk_scale, v_inv_scale, r, r_ld,
+                              proj, extent, window, sink, out, o_ld, scratch, scratch_floats, n_split, s);
+#else
+    (void) q16, (void) q_ld, (void) kc, (void) vc, (void) kv_cap, (void) H, (void) KV, (void) D, (void) Tq;
+    (void) qpos0, (void) qk_scale, (void) v_inv_scale, (void) r, (void) r_ld, (void) d_rel, (void) proj;
+    (void) extent, (void) window, (void) sink, (void) out, (void) o_ld, (void) scratch, (void) scratch_floats;
+    (void) n_split, (void) s;
+    std::fprintf(stderr, "ik2::k::attn_prefill_fp8: gfx12 only\n");
+    std::abort();
+#endif
 }
 void attn_probs_f16(const float* lg, uint16_t* out16, int H, int Tq, int nk, int qpos0, int kpos0, float qk_scale,
                     const float* r, int d_rel, const float* proj, int extent, int window, const float* sink,
