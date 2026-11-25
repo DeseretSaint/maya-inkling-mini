@@ -302,6 +302,11 @@ inline Layer& bind_visit(Model& M, int v) {
 // ---- the device helpers
 
 cublasHandle_t g_blas;
+// the loop gates' F32 products (loop_gates_chunk): on AMD a handle of rocBLAS's own GEMMs, made with
+// ROCBLAS_USE_HIPBLASLT=0.  hipBLASLt has no tuned kernel for them (at 8192 tokens a chunk) and picks one of its
+// fallback solutions from a list whose order changes from run to run - some of them split K - so the same prompt's
+// output changed between runs.  rocBLAS's choice is the problem's alone.  (On CUDA: g_blas itself.)
+cublasHandle_t g_blas_det;
 cudaStream_t g_s;
 cudaStream_t g_cs;          // the experts' copies of the token path, beside the compute stream
 cudaEvent_t g_ev;
@@ -1398,7 +1403,7 @@ void place_pictures(float* h, int T, int pos0, int C, cudaStream_t s) {
 struct DevCtx {
     cudaStream_t s = nullptr, cs = nullptr;
     cudaEvent_t ev = nullptr;
-    cublasHandle_t blas = nullptr;
+    cublasHandle_t blas = nullptr, blas_det = nullptr;
     Work W{};
     ExpertCache EC;
 };
@@ -1411,7 +1416,7 @@ void use_dev(int d) {
     if (g_stage) cudaFree(g_stage), g_stage = nullptr, g_stage_bytes = 0;   // (the previous device's)
     CU(cudaSetDevice(d));
     g_cur = d;
-    g_s = g_dev[d].s, g_cs = g_dev[d].cs, g_ev = g_dev[d].ev, g_blas = g_dev[d].blas;
+    g_s = g_dev[d].s, g_cs = g_dev[d].cs, g_ev = g_dev[d].ev, g_blas = g_dev[d].blas, g_blas_det = g_dev[d].blas_det;
 }
 
 // (kCand: sampling's candidates - the resident token path finds the largest logits on the device, g_cand; any other
@@ -1476,12 +1481,14 @@ void loop_gates_chunk(Work& W, const k::LoopGate* gt, int n, int T, int C, int R
     float *f = W.lp_f, *gn = f + (size_t) T * C;
     for (int j = 0; j < n; ++j) {
         // a1 [T][R] = x D_x^T, a2 = m D_m^T (D [R][2 C]: its rows' halves)
-        CB(cublasSgemm(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, R, T, C, &one, gt[j].D, 2 * C, gt[j].x, C, &zero, a1, R));
-        CB(cublasSgemm(g_blas, CUBLAS_OP_T, CUBLAS_OP_N, R, T, C, &one, gt[j].D + C, 2 * C, gt[j].m, C, &zero, a2, R));
+        // (g_blas_det: the same products every run - see its definition)
+        CB(cublasSgemm(g_blas_det, CUBLAS_OP_T, CUBLAS_OP_N, R, T, C, &one, gt[j].D, 2 * C, gt[j].x, C, &zero, a1, R));
+        CB(cublasSgemm(g_blas_det, CUBLAS_OP_T, CUBLAS_OP_N, R, T, C, &one, gt[j].D + C, 2 * C, gt[j].m, C, &zero, a2,
+                       R));
         k::loop_gate_mix(gt[j].x, gt[j].m, a1, a2, T, C, R, eps, g, g_s);
         // f [T][C] = g F, gn = g G (F, G [R][C])
-        CB(cublasSgemm(g_blas, CUBLAS_OP_N, CUBLAS_OP_N, C, T, R, &one, gt[j].F, C, g, R, &zero, f, C));
-        CB(cublasSgemm(g_blas, CUBLAS_OP_N, CUBLAS_OP_N, C, T, R, &one, gt[j].G, C, g, R, &zero, gn, C));
+        CB(cublasSgemm(g_blas_det, CUBLAS_OP_N, CUBLAS_OP_N, C, T, R, &one, gt[j].F, C, g, R, &zero, f, C));
+        CB(cublasSgemm(g_blas_det, CUBLAS_OP_N, CUBLAS_OP_N, C, T, R, &one, gt[j].G, C, g, R, &zero, gn, C));
         k::loop_gate_blend(gt[j].x, gt[j].m, f, gn, (size_t) T * C, gt[j].y, g_s);
     }
 }
@@ -4360,6 +4367,20 @@ int main(int argc, char** argv) {
         CB(cublasCreate(&g_dev[d].blas));
         CB(cublasSetStream(g_dev[d].blas, g_dev[d].s));
         CB(cublasSetMathMode(g_dev[d].blas, CUBLAS_DEFAULT_MATH));
+#if defined(__HIP_PLATFORM_AMD__)
+        {   // (rocBLAS reads ROCBLAS_USE_HIPBLASLT as a handle is made: set for this one alone, then as it was)
+            const char* was = getenv("ROCBLAS_USE_HIPBLASLT");
+            const std::string keep = was ? was : "";
+            setenv("ROCBLAS_USE_HIPBLASLT", "0", 1);
+            CB(cublasCreate(&g_dev[d].blas_det));
+            if (was) setenv("ROCBLAS_USE_HIPBLASLT", keep.c_str(), 1);
+            else unsetenv("ROCBLAS_USE_HIPBLASLT");
+        }
+        CB(cublasSetStream(g_dev[d].blas_det, g_dev[d].s));
+        CB(cublasSetMathMode(g_dev[d].blas_det, CUBLAS_DEFAULT_MATH));
+#else
+        g_dev[d].blas_det = g_dev[d].blas;
+#endif
     }
     g_ep = n_gpu == 2 && getenv("IK2_EP") && std::atoi(getenv("IK2_EP"));
     g_tp = n_gpu == 2 && !g_ep && getenv("IK2_TP") && std::atoi(getenv("IK2_TP"));
